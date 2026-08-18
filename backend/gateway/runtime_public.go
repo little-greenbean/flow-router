@@ -122,12 +122,15 @@ func (rt *Runtime) HandleModels(c *gin.Context) {
 						break
 					}
 				}
+				if !routeAllowsModel(stored, route.ID, id) {
+					continue
+				}
 				add(id)
 			}
 		}
 		if mode == storage.GatewayModelsModeHybrid {
 			for _, it := range stored {
-				if it.Source == "custom" {
+				if it.Source == "custom" || it.Source == "catalog" {
 					add(it.ID)
 				}
 			}

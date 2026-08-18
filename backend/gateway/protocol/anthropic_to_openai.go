@@ -112,7 +112,7 @@ func AnthropicToOpenAIRequest(body []byte, model string, stream bool) ([]byte, e
 				"function": map[string]any{
 					"name":        tm["name"],
 					"description": tm["description"],
-					"parameters":   tm["input_schema"],
+					"parameters":  tm["input_schema"],
 				},
 			})
 		}

@@ -218,9 +218,9 @@ type OpenAIToAnthropicStream struct {
 	done    bool
 
 	// 当前内容块
-	textOpen      bool
-	textIndex     int
-	nextBlockIdx  int
+	textOpen     bool
+	textIndex    int
+	nextBlockIdx int
 	// chat tool index → anthropic content block index
 	toolBlockIdx map[int]int
 	toolOpened   map[int]bool
@@ -403,8 +403,8 @@ func (s *OpenAIToAnthropicStream) Close() [][]byte {
 	// 若全程无内容，补一个空 text block（Anthropic 要求 content 非空列表更稳）
 	if s.nextBlockIdx == 0 {
 		out = append(out, encodeSSEFrame("content_block_start", map[string]any{
-			"type":  "content_block_start",
-			"index": 0,
+			"type":          "content_block_start",
+			"index":         0,
 			"content_block": map[string]any{"type": "text", "text": ""},
 		}))
 		out = append(out, encodeSSEFrame("content_block_stop", map[string]any{

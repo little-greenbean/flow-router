@@ -27,7 +27,7 @@ func (svc *Service) ParseModelsJSON(raw string) []ModelListItem {
 			continue
 		}
 		src := strings.TrimSpace(it.Source)
-		if src != "custom" {
+		if src != "custom" && src != "catalog" {
 			src = "sync"
 		}
 		item := ModelListItem{

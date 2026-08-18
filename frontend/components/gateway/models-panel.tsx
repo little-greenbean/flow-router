@@ -1,4 +1,4 @@
-import { Loader2, Plus, RefreshCw } from "lucide-react"
+import { DatabaseZap, Loader2, Plus, RefreshCw } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
@@ -57,9 +57,9 @@ const MODELS_MODE_OPTIONS = [
   },
   {
     value: "hybrid",
-    label: "hybrid · 聚合∪自定义",
-    description: "实时聚合上游模型，并合并下方 source=自定义 的项",
-    hint: "公开模型目录 = 上游实时聚合 ∪ 下方「自定义」模型；同步得到的项不会额外并入。",
+    label: "hybrid · 聚合∪补充目录",
+    description: "实时聚合上游模型，并合并自定义和官方目录项",
+    hint: "公开模型目录 = 上游实时聚合 ∪ 下方「自定义」模型 ∪「官方目录」模型。",
   },
 ] as const
 
@@ -75,6 +75,7 @@ type ModelsPanelProps = {
   modelsMode: string
   onModelsModeChange: (v: string) => void
   onSyncModels: () => void
+  onOpenCatalog: () => void
   onSave: () => void
   customModel: string
   onCustomModelChange: (v: string) => void
@@ -98,6 +99,7 @@ export function ModelsPanel({
   modelsMode,
   onModelsModeChange,
   onSyncModels,
+  onOpenCatalog,
   onSave,
   customModel,
   onCustomModelChange,
@@ -166,6 +168,14 @@ export function ModelsPanel({
       >
         <RefreshCw className="size-3.5" /> 从渠道同步去重
       </Button>
+      <Button
+        className="h-9"
+        variant="outline"
+        onClick={() => void onOpenCatalog()}
+        disabled={busy}
+      >
+        <DatabaseZap className="size-3.5" /> 同步官方模型目录
+      </Button>
     </div>
 
     <div className="w-full min-w-0 space-y-2">
@@ -201,12 +211,14 @@ export function ModelsPanel({
                         {m.id}
                       </code>
                       <Badge
-                        variant={
-                          m.source === "custom" ? "secondary" : "outline"
-                        }
+                        variant={m.source === "custom" ? "secondary" : "outline"}
                         className="h-5 shrink-0 px-1.5 text-[10px] font-normal"
                       >
-                        {m.source === "custom" ? "自定义" : "同步"}
+                        {m.source === "custom"
+                          ? "自定义"
+                          : m.source === "catalog"
+                            ? "官方目录"
+                            : "同步"}
                       </Badge>
                     </div>
                   </TableCell>

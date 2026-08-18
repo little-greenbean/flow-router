@@ -690,9 +690,27 @@ export interface GatewayModelSource {
 
 export interface GatewayModelListItem {
   id: string
-  source: "sync" | "custom"
+  source: "sync" | "custom" | "catalog"
   channel_ids?: number[]
   sources?: GatewayModelSource[]
+}
+
+export interface GatewayCatalogModel {
+  model_name: string
+  description?: string
+  icon?: string
+  tags?: string
+  vendor_name?: string
+  status: number
+}
+
+export interface GatewayCatalogSyncResult {
+  group: GatewayGroup
+  model_ids: string[]
+  route_ids: number[]
+  model_count: number
+  mode_changed: boolean
+  models_mode: GatewayModelsMode
 }
 
 export interface GatewayModelTestResult {

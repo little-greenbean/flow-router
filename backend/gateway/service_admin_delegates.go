@@ -151,6 +151,16 @@ func (s *Service) SyncGroupModels(ctx context.Context, groupID uint, in SyncGrou
 	return s.admin().SyncGroupModels(ctx, groupID, in)
 }
 
+// ListOfficialModelCatalog 返回 Sub2API 兼容的官方模型目录。
+func (s *Service) ListOfficialModelCatalog(ctx context.Context) ([]CatalogModel, error) {
+	return s.admin().ListOfficialModelCatalog(ctx)
+}
+
+// SyncCatalogModels 将选中的官方模型绑定到组内指定路由。
+func (s *Service) SyncCatalogModels(ctx context.Context, groupID uint, in CatalogSyncInput) (*CatalogSyncResult, error) {
+	return s.admin().SyncCatalogModels(ctx, groupID, in)
+}
+
 // TestGroupModel 向路由发最小请求探测模型是否可用。
 func (s *Service) TestGroupModel(ctx context.Context, groupID uint, in TestModelInput) ([]ModelTestResult, error) {
 	return s.admin().TestGroupModel(ctx, groupID, in)

@@ -16,13 +16,13 @@ type ResponsesToAnthropicStream struct {
 	messageStopSent  bool
 	done             bool
 
-	contentBlockIndex int
-	contentBlockOpen  bool
-	currentBlockType  string // text | thinking | tool_use
-	currentToolName   string
-	currentToolArgs   string
+	contentBlockIndex   int
+	contentBlockOpen    bool
+	currentBlockType    string // text | thinking | tool_use
+	currentToolName     string
+	currentToolArgs     string
 	currentToolHadDelta bool
-	hasToolCall       bool
+	hasToolCall         bool
 
 	// output_index → anthropic content block index
 	outputIndexToBlockIdx map[int]int
@@ -493,8 +493,8 @@ func (s *ResponsesToAnthropicStream) synthesizeFromOutput(resp map[string]any) [
 			s.contentBlockOpen = true
 			s.currentBlockType = "thinking"
 			frames = append(frames, encodeSSEFrame("content_block_start", map[string]any{
-				"type":  "content_block_start",
-				"index": idx,
+				"type":          "content_block_start",
+				"index":         idx,
 				"content_block": map[string]any{"type": "thinking", "thinking": ""},
 			}))
 			frames = append(frames, encodeSSEFrame("content_block_delta", map[string]any{
@@ -528,8 +528,8 @@ func (s *ResponsesToAnthropicStream) synthesizeFromOutput(resp map[string]any) [
 			s.contentBlockOpen = true
 			s.currentBlockType = "text"
 			frames = append(frames, encodeSSEFrame("content_block_start", map[string]any{
-				"type":  "content_block_start",
-				"index": idx,
+				"type":          "content_block_start",
+				"index":         idx,
 				"content_block": map[string]any{"type": "text", "text": ""},
 			}))
 			frames = append(frames, encodeSSEFrame("content_block_delta", map[string]any{

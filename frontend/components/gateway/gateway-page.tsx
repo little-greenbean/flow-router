@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 import {
   DollarSign,
+  Gauge,
   Layers,
   Loader2,
   Pencil,
@@ -21,6 +22,8 @@ import { apiFetch } from "@/lib/api"
 import { useChannels } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 import type {
+  GatewayCatalogModel,
+  GatewayCatalogSyncResult,
   GatewayEnsureKeysResult,
   GatewayGroup,
   GatewayKey,
@@ -49,7 +52,9 @@ import { GatewayProvidersPanel } from "./gateway-providers-panel"
 import { GroupsSidebar } from "./groups-sidebar"
 import { KeysPanel } from "./keys-panel"
 import { RoutesPanel } from "./routes-panel"
+import { SchedulerWorkbench } from "./scheduler-workbench"
 import { ModelsPanel } from "./models-panel"
+import { CatalogModelDialog } from "./catalog-model-dialog"
 import { UsagePanel } from "./usage-panel"
 import { PricesPanel } from "./prices-panel"
 import { PromptInjectionPanel } from "./prompt-injection-panel"
@@ -173,6 +178,10 @@ export function GatewayPage() {
   const [modelSyncResult, setModelSyncResult] = useState<GatewayModelSyncResult | null>(
     null,
   )
+  const [catalogOpen, setCatalogOpen] = useState(false)
+  const [catalogModels, setCatalogModels] = useState<GatewayCatalogModel[]>([])
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [catalogApplying, setCatalogApplying] = useState(false)
   const [ensureKeysOpen, setEnsureKeysOpen] = useState(false)
   const [ensureKeysResult, setEnsureKeysResult] =
     useState<GatewayEnsureKeysResult | null>(null)
@@ -703,7 +712,6 @@ export function GatewayPage() {
     }
     void reloadGroupDetail(selectedGroup)
     // 仅在切换组时重载密钥/路由；使用记录独立，不受网关组影响
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedGroup?.id, reloadGroupDetail])
 
   function openCreateGroup() {
@@ -1269,6 +1277,48 @@ export function GatewayPage() {
     }
   }
 
+  async function openCatalog() {
+    setCatalogOpen(true)
+    setCatalogLoading(true)
+    try {
+      const res = await apiFetch<{ items: GatewayCatalogModel[] }>(
+        "/gateway/models/catalog",
+      )
+      setCatalogModels(res.items ?? [])
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "官方模型目录加载失败")
+    } finally {
+      setCatalogLoading(false)
+    }
+  }
+
+  async function applyCatalog(modelIDs: string[], routeIDs: number[]) {
+    if (!selectedGroup) return
+    setCatalogApplying(true)
+    try {
+      const res = await apiFetch<GatewayCatalogSyncResult>(
+        `/gateway/groups/${selectedGroup.id}/models/catalog-sync`,
+        {
+          method: "POST",
+          body: JSON.stringify({ models: modelIDs, route_ids: routeIDs }),
+        },
+      )
+      setModelItems(parseModelsJSON(res.group.models_json))
+      setModelsMode(res.group.models_mode || res.models_mode || "hybrid")
+      setGroups((current) =>
+        current.map((group) => (group.id === res.group.id ? res.group : group)),
+      )
+      setCatalogOpen(false)
+      toast.success(
+        `已同步 ${res.model_count} 个模型，绑定 ${res.route_ids.length} 条路由${res.mode_changed ? "，模式已切换为 hybrid" : ""}`,
+      )
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "官方模型目录同步失败")
+    } finally {
+      setCatalogApplying(false)
+    }
+  }
+
   function addCustomModel() {
     const id = customModel.trim()
     if (!id) return
@@ -1584,6 +1634,9 @@ export function GatewayPage() {
                       <TabsTrigger value="routes" className="flex-none gap-1.5 px-3 py-1.5">
                         <Route className="size-3.5" /> 渠道路由
                       </TabsTrigger>
+                      <TabsTrigger value="scheduler" className="flex-none gap-1.5 px-3 py-1.5">
+                        <Gauge className="size-3.5" /> 调度
+                      </TabsTrigger>
                       <TabsTrigger value="models" className="flex-none gap-1.5 px-3 py-1.5">
                         <Layers className="size-3.5" /> 模型映射
                       </TabsTrigger>
@@ -1631,12 +1684,22 @@ export function GatewayPage() {
                       />
                     </TabsContent>
 
+                    <TabsContent value="scheduler" className="mt-0 space-y-4">
+                      <SchedulerWorkbench
+                        group={selectedGroup}
+                        routes={routeDrafts}
+                        sourceGroupsByChannel={sourceGroupsByChannel}
+                        providers={providerOptions}
+                      />
+                    </TabsContent>
+
                     <TabsContent value="models" className="mt-0 space-y-4">
                       <ModelsPanel
                         busy={busy}
                         modelsMode={modelsMode}
                         onModelsModeChange={setModelsMode}
                         onSyncModels={() => void syncModels()}
+                        onOpenCatalog={() => void openCatalog()}
                         onSave={() => void saveGroupConfig()}
                         customModel={customModel}
                         onCustomModelChange={setCustomModel}
@@ -1708,7 +1771,6 @@ export function GatewayPage() {
             setUsageFrom={setUsageFrom}
             usageTo={usageTo}
             setUsageTo={setUsageTo}
-            usagePage={usagePage}
             setUsagePage={setUsagePage}
             usagePageSize={usagePageSize}
             setUsagePageSize={setUsagePageSize}
@@ -1771,6 +1833,18 @@ export function GatewayPage() {
         open={modelSyncOpen}
         onOpenChange={setModelSyncOpen}
         modelSyncResult={modelSyncResult}
+      />
+
+      <CatalogModelDialog
+        open={catalogOpen}
+        onOpenChange={setCatalogOpen}
+        models={catalogModels}
+        routes={routeDrafts}
+        channelNameByID={channelNameByID}
+        providerNameByID={providerNameByID}
+        loading={catalogLoading}
+        applying={catalogApplying}
+        onApply={(modelIDs, routeIDs) => void applyCatalog(modelIDs, routeIDs)}
       />
 
       <GroupFormDialog

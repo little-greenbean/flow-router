@@ -283,7 +283,6 @@ type UsagePanelProps = {
   setUsageFrom: (v: string) => void
   usageTo: string
   setUsageTo: (v: string) => void
-  usagePage: number
   setUsagePage: (v: number) => void
   usagePageSize: number
   setUsagePageSize: (v: number) => void
@@ -314,7 +313,6 @@ export function UsagePanel({
   setUsageFrom,
   usageTo,
   setUsageTo,
-  usagePage,
   setUsagePage,
   usagePageSize,
   setUsagePageSize,

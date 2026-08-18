@@ -60,6 +60,11 @@ func (rt *Runtime) HandleForward(c *gin.Context, path string, kind protocolKind)
 		rt.writeGatewayError(c, kind, http.StatusServiceUnavailable, "api_error", "no routes configured")
 		return
 	}
+	routes = filterRoutesForModel(routes, rt.ParseModelsJSON(group.ModelsJSON), requestedModel)
+	if len(routes) == 0 {
+		rt.writeGatewayError(c, kind, http.StatusServiceUnavailable, "api_error", "no route is bound to this model")
+		return
+	}
 
 	groupsByChannel := rt.loadGroupsByChannel(c.Request.Context(), routes)
 	groupMapping := ParseModelMapping(group.ModelMappingJSON)

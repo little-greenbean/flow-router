@@ -168,9 +168,27 @@ type ModelSource struct {
 // ModelListItem 组内模型清单项（sync 来自上游，custom 为手工）。
 type ModelListItem struct {
 	ID         string        `json:"id"`
-	Source     string        `json:"source"` // sync | custom
+	Source     string        `json:"source"` // sync | custom | catalog
 	ChannelIDs []uint        `json:"channel_ids,omitempty"`
 	Sources    []ModelSource `json:"sources,omitempty"`
+}
+
+// CatalogSyncInput selects public catalog models and the enabled routes that
+// are allowed to serve them. The same route set applies to every selected
+// model in one operation.
+type CatalogSyncInput struct {
+	Models   []string `json:"models"`
+	RouteIDs []uint   `json:"route_ids"`
+}
+
+// CatalogSyncResult describes a successful catalog binding operation.
+type CatalogSyncResult struct {
+	Group       *storage.GatewayGroup `json:"group"`
+	ModelIDs    []string              `json:"model_ids"`
+	RouteIDs    []uint                `json:"route_ids"`
+	ModelCount  int                   `json:"model_count"`
+	ModeChanged bool                  `json:"mode_changed"`
+	ModelsMode  string                `json:"models_mode"`
 }
 
 // ModelPreviewItem 模型预览项（尚未落库的合并结果）。

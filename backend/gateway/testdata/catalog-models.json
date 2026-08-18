@@ -1,0 +1,20 @@
+{
+  "data": [
+    {
+      "model_name": "gpt-5.6",
+      "description": "Local catalog fixture",
+      "icon": "OpenAI.Color",
+      "tags": "reasoning",
+      "vendor_name": "OpenAI",
+      "status": 1
+    },
+    {
+      "model_name": "claude-4",
+      "description": "Second local catalog fixture",
+      "icon": "Anthropic.Color",
+      "tags": "chat",
+      "vendor_name": "Anthropic",
+      "status": 1
+    }
+  ]
+}

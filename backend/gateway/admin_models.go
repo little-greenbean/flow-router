@@ -15,6 +15,117 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// ListOfficialModelCatalog returns the public metadata directory used by
+// Sub2API's "sync latest models" action.
+func (a *AdminService) ListOfficialModelCatalog(ctx context.Context) ([]CatalogModel, error) {
+	return FetchOfficialModelCatalog(ctx)
+}
+
+// SyncCatalogModels binds selected official catalog models to enabled routes in
+// one gateway group. It is deliberately separate from channel /v1/models sync:
+// catalog entries are metadata declarations, not proof of live availability.
+func (a *AdminService) SyncCatalogModels(ctx context.Context, groupID uint, in CatalogSyncInput) (*CatalogSyncResult, error) {
+	group, err := a.Groups.FindByID(groupID)
+	if err != nil {
+		return nil, err
+	}
+	routes, err := a.Routes.ListByGroupID(groupID)
+	if err != nil {
+		return nil, err
+	}
+	routeIDs := make([]uint, 0, len(in.RouteIDs))
+	routeSeen := make(map[uint]struct{}, len(in.RouteIDs))
+	for _, id := range in.RouteIDs {
+		if _, ok := routeSeen[id]; ok {
+			continue
+		}
+		routeSeen[id] = struct{}{}
+		routeIDs = append(routeIDs, id)
+	}
+	if err := validateCatalogRouteIDs(routeIDs, routes); err != nil {
+		return nil, err
+	}
+	requested := make([]string, 0, len(in.Models))
+	seen := make(map[string]struct{}, len(in.Models))
+	for _, id := range in.Models {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		requested = append(requested, id)
+	}
+	if len(requested) == 0 {
+		return nil, errors.New("at least one catalog model is required")
+	}
+
+	catalog, err := FetchOfficialModelCatalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]CatalogModel, len(catalog))
+	for _, model := range catalog {
+		byID[model.ID] = model
+	}
+	selected := make([]CatalogModel, 0, len(requested))
+	for _, id := range requested {
+		model, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("catalog model %q was not found", id)
+		}
+		selected = append(selected, model)
+	}
+
+	selectedRoutes := make(map[uint]storage.GatewayRoute, len(routeIDs))
+	for _, route := range routes {
+		for _, id := range routeIDs {
+			if route.ID == id {
+				selectedRoutes[id] = route
+				break
+			}
+		}
+	}
+	sources := make([]ModelSource, 0, len(routeIDs))
+	for _, id := range routeIDs {
+		route := selectedRoutes[id]
+		source := ModelSource{RouteID: route.ID, ChannelID: route.SourceChannelID,
+			SourceGroupID: route.SourceGroupID, SourceGroupName: strings.TrimSpace(route.SourceGroupName)}
+		if route.NormalizeSourceKind() == storage.GatewayRouteSourceProvider {
+			if a.Providers != nil {
+				if provider, findErr := a.Providers.FindByID(route.GatewayProviderID); findErr == nil && provider != nil {
+					source.ChannelName = provider.Name
+				}
+			}
+		} else if a.Channels != nil {
+			if channel, findErr := a.Channels.FindByID(route.SourceChannelID); findErr == nil && channel != nil {
+				source.ChannelName = channel.Name
+			}
+		}
+		sources = append(sources, source)
+	}
+
+	existing := a.ParseModelsJSON(group.ModelsJSON)
+	merged := mergeCatalogModels(existing, selected, sources)
+	group.ModelsJSON = a.ModelsJSONString(merged)
+	mode := group.ModelsMode
+	modeChanged := false
+	if strings.TrimSpace(mode) == "" || mode == storage.GatewayModelsModeAuto {
+		group.ModelsMode = storage.GatewayModelsModeHybrid
+		modeChanged = true
+	}
+	if err := a.Groups.Update(group); err != nil {
+		return nil, err
+	}
+	a.invalidateModelsCache(groupID)
+	return &CatalogSyncResult{
+		Group: group, ModelIDs: requested, RouteIDs: routeIDs,
+		ModelCount: len(selected), ModeChanged: modeChanged, ModelsMode: group.ModelsMode,
+	}, nil
+}
+
 func (a *AdminService) collectGroupModels(
 	ctx context.Context,
 	groupID uint,
@@ -289,6 +400,7 @@ func (a *AdminService) TestGroupModel(ctx context.Context, groupID uint, in Test
 	if err != nil {
 		return nil, err
 	}
+	routes = filterRoutesForModel(routes, a.ParseModelsJSON(group.ModelsJSON), model)
 	groupMapping := ParseModelMapping(group.ModelMappingJSON)
 	now := time.Now()
 

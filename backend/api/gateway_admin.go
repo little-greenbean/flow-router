@@ -39,8 +39,10 @@ func registerGatewayAdmin(g *gin.RouterGroup, d *Deps) {
 		gp.POST("/groups/:id/routes/ensure-keys", func(c *gin.Context) { ensureGatewayGroupRouteKeys(c, d) })
 
 		// models
+		gp.GET("/models/catalog", func(c *gin.Context) { listGatewayModelCatalog(c, d) })
 		gp.GET("/groups/:id/models/preview", func(c *gin.Context) { previewGatewayGroupModels(c, d) })
 		gp.POST("/groups/:id/models/sync", func(c *gin.Context) { syncGatewayGroupModels(c, d) })
+		gp.POST("/groups/:id/models/catalog-sync", func(c *gin.Context) { syncGatewayCatalogModels(c, d) })
 		gp.POST("/groups/:id/models/test", func(c *gin.Context) { testGatewayGroupModel(c, d) })
 
 		// key ops
@@ -360,6 +362,15 @@ func previewGatewayGroupModels(c *gin.Context, d *Deps) {
 	c.JSON(http.StatusOK, gin.H{"items": list})
 }
 
+func listGatewayModelCatalog(c *gin.Context, d *Deps) {
+	items, err := d.Gateway.ListOfficialModelCatalog(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
 func syncGatewayGroupModels(c *gin.Context, d *Deps) {
 	id, err := parseUintParam(c, "id")
 	if err != nil {
@@ -371,6 +382,25 @@ func syncGatewayGroupModels(c *gin.Context, d *Deps) {
 	_ = c.ShouldBindJSON(&in)
 	// 单渠道失败会跳过并在 routes 明细中体现，不因个别渠道失败而整体 4xx
 	res, err := d.Gateway.SyncGroupModels(c.Request.Context(), id, in)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+func syncGatewayCatalogModels(c *gin.Context, d *Deps) {
+	id, err := parseUintParam(c, "id")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	var in gateway.CatalogSyncInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	res, err := d.Gateway.SyncCatalogModels(c.Request.Context(), id, in)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

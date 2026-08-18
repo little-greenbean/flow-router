@@ -10,7 +10,7 @@ import type {
 } from "@/lib/api-types"
 
 export type MainTab = "gateway" | "providers" | "usage" | "prices"
-export type ConfigTab = "keys" | "routes" | "models" | "service-tier" | "prompt"
+export type ConfigTab = "keys" | "routes" | "scheduler" | "models" | "service-tier" | "prompt"
 
 export type ModelSourceLabel = {
   key: string
@@ -360,10 +360,13 @@ export function routeAccountRate(
   }
   const sourceGroupName = (route.source_group_name ?? "").trim()
   const sourceGroupID = Number(route.source_group_id || 0)
-  const sourceRatio =
-    (sourceGroupName
-      ? groups.find((g) => g.model_name === sourceGroupName)?.ratio
-      : groups.find((g) => g.remote_group_id === sourceGroupID)?.ratio) ?? 1
+  const matchedRatio = sourceGroupName
+    ? groups.find((g) => g.model_name === sourceGroupName)?.ratio
+    : groups.find((g) => g.remote_group_id === sourceGroupID)?.ratio
+  // Runtime fallback: when the live source-group snapshot is unavailable,
+  // preserve the persisted billing multiplier so preview order stays stable.
+  const savedRate = Number(route.billing_rate_multiplier)
+  const sourceRatio = matchedRatio ?? (savedRate > 0 ? savedRate : 1)
   switch (route.rate_convert_mode) {
     case "multiply_100":
       return sourceRatio * 100
