@@ -1126,3 +1126,77 @@ func TestGatewayUsageListModels(t *testing.T) {
 		t.Fatalf("model filter should be ignored, got %d", len(withModel))
 	}
 }
+
+func TestGatewayUsageDispatchStats(t *testing.T) {
+	db := openTestDB(t)
+	usage := NewGatewayUsageLogs(db)
+	if err := db.Create(&GatewayGroup{ID: 1, Name: "组一"}).Error; err != nil {
+		t.Fatalf("create group 1: %v", err)
+	}
+	if err := db.Create(&GatewayGroup{ID: 2, Name: "组二"}).Error; err != nil {
+		t.Fatalf("create group 2: %v", err)
+	}
+	if err := db.Create(&GatewayRoute{ID: 11, GatewayGroupID: 1, Position: 0}).Error; err != nil {
+		t.Fatalf("create route 11: %v", err)
+	}
+	if err := db.Create(&GatewayRoute{ID: 12, GatewayGroupID: 1, Position: 1}).Error; err != nil {
+		t.Fatalf("create route 12: %v", err)
+	}
+	if err := db.Create(&GatewayRoute{ID: 21, GatewayGroupID: 2, Position: 0}).Error; err != nil {
+		t.Fatalf("create route 21: %v", err)
+	}
+
+	now := time.Now().UTC()
+	inside := now.Add(-2 * time.Minute)
+	rows := []GatewayUsageLog{
+		{GatewayGroupID: 1, RouteID: 11, RequestID: "r1", ProviderName: "上游 A", Success: false, CreatedAt: inside, FirstTokenMS: ptrInt64(500)},
+		{GatewayGroupID: 1, RouteID: 11, RequestID: "r1", ProviderName: "上游 A", Success: true, CreatedAt: inside.Add(time.Second), FirstTokenMS: ptrInt64(700)},
+		{GatewayGroupID: 1, RouteID: 11, RequestID: "r2", ProviderName: "上游 A", Success: true, CreatedAt: inside.Add(2 * time.Second)},
+		{GatewayGroupID: 1, RouteID: 12, RequestID: "r3", ProviderName: "上游 B", Success: false, CreatedAt: inside.Add(3 * time.Second), FirstTokenMS: ptrInt64(900)},
+		{GatewayGroupID: 2, RouteID: 21, RequestID: "r4", ProviderName: "上游 C", Success: true, CreatedAt: inside.Add(4 * time.Second), FirstTokenMS: ptrInt64(100)},
+		{GatewayGroupID: 1, RouteID: 11, RequestID: "outside", ProviderName: "上游 A", Success: false, CreatedAt: now.Add(-2 * time.Hour), FirstTokenMS: ptrInt64(9999)},
+	}
+	for i := range rows {
+		if err := usage.Create(&rows[i]); err != nil {
+			t.Fatalf("create usage %d: %v", i, err)
+		}
+	}
+
+	groups, err := usage.DispatchStats(now.Add(-5*time.Minute), now)
+	if err != nil {
+		t.Fatalf("dispatch stats: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("want 2 groups, got %+v", groups)
+	}
+	if groups[0].GatewayGroupID != 1 || groups[0].GatewayGroupName != "组一" {
+		t.Fatalf("unexpected first group: %+v", groups[0])
+	}
+	if len(groups[0].Routes) != 2 {
+		t.Fatalf("want 2 routes in group 1, got %+v", groups[0].Routes)
+	}
+	first := groups[0].Routes[0]
+	if first.RouteID != 11 || first.TotalAttempts != 3 || first.FailedAttempts != 1 {
+		t.Fatalf("unexpected route 11 counts: %+v", first)
+	}
+	if first.FailureRate != 1.0/3.0 || first.FirstTokenSamples != 2 || first.AverageFirstTokenMS == nil || *first.AverageFirstTokenMS != 600 {
+		t.Fatalf("unexpected route 11 metrics: %+v", first)
+	}
+	second := groups[0].Routes[1]
+	if second.RouteID != 12 || second.FailureRate != 1 || second.AverageFirstTokenMS == nil || *second.AverageFirstTokenMS != 900 {
+		t.Fatalf("unexpected route 12 metrics: %+v", second)
+	}
+	if groups[1].Routes[0].RouteID != 21 || groups[1].Routes[0].FailureRate != 0 {
+		t.Fatalf("unexpected group 2 metrics: %+v", groups[1])
+	}
+
+	empty, err := usage.DispatchStats(now, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("empty dispatch stats: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("want empty groups, got %+v", empty)
+	}
+}
+
+func ptrInt64(v int64) *int64 { return &v }

@@ -579,6 +579,116 @@ type GatewayUsageLogs struct{ db *gorm.DB }
 // NewGatewayUsageLogs 构造用量日志仓储。
 func NewGatewayUsageLogs(db *gorm.DB) *GatewayUsageLogs { return &GatewayUsageLogs{db: db} }
 
+// GatewayDispatchStatsGroup 是主页调度健康面板的网关组聚合结果。
+type GatewayDispatchStatsGroup struct {
+	GatewayGroupID   uint                        `json:"gateway_group_id"`
+	GatewayGroupName string                      `json:"gateway_group_name"`
+	Routes           []GatewayDispatchStatsRoute `json:"routes"`
+}
+
+// GatewayDispatchStatsRoute 是单条路由在时间窗口内的尝试聚合结果。
+type GatewayDispatchStatsRoute struct {
+	RouteID             uint     `json:"route_id"`
+	RouteName           string   `json:"route_name"`
+	ProviderName        string   `json:"provider_name,omitempty"`
+	TotalAttempts       int64    `json:"total_attempts"`
+	FailedAttempts      int64    `json:"failed_attempts"`
+	FailureRate         float64  `json:"failure_rate"`
+	FirstTokenSamples   int64    `json:"first_token_samples"`
+	AverageFirstTokenMS *float64 `json:"average_first_token_ms"`
+}
+
+// DispatchStats 按网关组和路由聚合窗口内的每次调度尝试。
+// from/to 使用半开区间 [from, to)，调用方应传入同一时区的时间。
+func (r *GatewayUsageLogs) DispatchStats(from, to time.Time) ([]GatewayDispatchStatsGroup, error) {
+	type aggregateRow struct {
+		GatewayGroupID      uint
+		RouteID             uint
+		ProviderName        string
+		TotalAttempts       int64
+		FailedAttempts      int64
+		FirstTokenSamples   int64
+		AverageFirstTokenMS *float64
+	}
+
+	var rows []aggregateRow
+	query := r.db.Model(&GatewayUsageLog{}).
+		Select(`
+			gateway_group_id,
+			route_id,
+			MAX(provider_name) AS provider_name,
+			COUNT(*) AS total_attempts,
+			COALESCE(SUM(CASE WHEN success = ? THEN 1 ELSE 0 END), 0) AS failed_attempts,
+			COUNT(first_token_ms) AS first_token_samples,
+			AVG(first_token_ms) AS average_first_token_ms
+		`, false).
+		Where("created_at >= ? AND created_at < ?", from, to).
+		Group("gateway_group_id, route_id").
+		Order("gateway_group_id ASC, route_id ASC")
+	if err := query.Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return []GatewayDispatchStatsGroup{}, nil
+	}
+
+	groupIDs := make([]uint, 0, len(rows))
+	seenGroups := make(map[uint]struct{}, len(rows))
+	for _, row := range rows {
+		if _, ok := seenGroups[row.GatewayGroupID]; !ok {
+			seenGroups[row.GatewayGroupID] = struct{}{}
+			groupIDs = append(groupIDs, row.GatewayGroupID)
+		}
+	}
+	type groupNameRow struct {
+		ID   uint
+		Name string
+	}
+	var groupNames []groupNameRow
+	if err := r.db.Model(&GatewayGroup{}).Select("id, name").Where("id IN ?", groupIDs).Find(&groupNames).Error; err != nil {
+		return nil, err
+	}
+	groupNameByID := make(map[uint]string, len(groupNames))
+	for _, group := range groupNames {
+		groupNameByID[group.ID] = group.Name
+	}
+
+	groups := make([]GatewayDispatchStatsGroup, 0, len(groupIDs))
+	groupIndex := make(map[uint]int, len(groupIDs))
+	for _, id := range groupIDs {
+		name := groupNameByID[id]
+		if strings.TrimSpace(name) == "" {
+			name = fmt.Sprintf("组 #%d", id)
+		}
+		groupIndex[id] = len(groups)
+		groups = append(groups, GatewayDispatchStatsGroup{
+			GatewayGroupID:   id,
+			GatewayGroupName: name,
+			Routes:           make([]GatewayDispatchStatsRoute, 0),
+		})
+	}
+	for _, row := range rows {
+		failureRate := 0.0
+		if row.TotalAttempts > 0 {
+			failureRate = float64(row.FailedAttempts) / float64(row.TotalAttempts)
+		}
+		groups[groupIndex[row.GatewayGroupID]].Routes = append(
+			groups[groupIndex[row.GatewayGroupID]].Routes,
+			GatewayDispatchStatsRoute{
+				RouteID:             row.RouteID,
+				RouteName:           fmt.Sprintf("路由 #%d", row.RouteID),
+				ProviderName:        strings.TrimSpace(row.ProviderName),
+				TotalAttempts:       row.TotalAttempts,
+				FailedAttempts:      row.FailedAttempts,
+				FailureRate:         failureRate,
+				FirstTokenSamples:   row.FirstTokenSamples,
+				AverageFirstTokenMS: row.AverageFirstTokenMS,
+			},
+		)
+	}
+	return groups, nil
+}
+
 // Create 插入记录。
 func (r *GatewayUsageLogs) Create(item *GatewayUsageLog) error {
 	if item.CreatedAt.IsZero() {
