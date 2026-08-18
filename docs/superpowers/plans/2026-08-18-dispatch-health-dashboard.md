@@ -101,7 +101,7 @@
 
 - [ ] **Step 2: Run tests and verify they fail**
 
-  Run `pnpm --dir frontend exec vitest run components/monitor/dispatch-health-utils.test.ts`，Expected: 模块/函数未定义。
+  Run `node --test --experimental-strip-types frontend/components/monitor/dispatch-health-utils.test.ts`，Expected: 模块/函数未定义。
 
 - [ ] **Step 3: Implement types and query hook**
 
@@ -109,7 +109,7 @@
 
 - [ ] **Step 4: Implement utilities and run tests**
 
-  实现格式化与颜色分级纯函数，运行同一 vitest 命令，Expected: PASS。
+  实现格式化与颜色分级纯函数，运行同一 Node 测试命令，Expected: PASS。
 
 - [ ] **Step 5: Commit**
 
