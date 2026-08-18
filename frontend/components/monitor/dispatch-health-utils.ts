@@ -1,4 +1,4 @@
-import type { GatewayDispatchWindow } from "@/lib/api-types"
+import type { GatewayDispatchStatsRoute, GatewayDispatchWindow } from "@/lib/api-types"
 
 export const DISPATCH_WINDOW_OPTIONS: { value: GatewayDispatchWindow; label: string }[] = [
   { value: "1m", label: "1 分钟" },
@@ -27,4 +27,10 @@ export function failureRateTone(rate: number): FailureRateTone {
 export function formatFirstToken(ms: number | null | undefined): string {
   if (ms == null || !Number.isFinite(ms)) return "暂无数据"
   return `${Math.max(0, Math.round(ms))} ms`
+}
+
+export function formatDispatchRouteMetric(
+  route: Pick<GatewayDispatchStatsRoute, "failure_rate" | "average_first_token_ms">,
+): string {
+  return `失败 ${formatFailureRate(route.failure_rate)} · 首字 ${formatFirstToken(route.average_first_token_ms)}`
 }

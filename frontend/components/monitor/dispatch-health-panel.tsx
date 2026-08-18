@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils"
 import {
   DISPATCH_WINDOW_OPTIONS,
   failureRateTone,
+  formatDispatchRouteMetric,
   formatFailureRate,
   formatFirstToken,
 } from "@/components/monitor/dispatch-health-utils"
@@ -23,19 +24,14 @@ export function DispatchHealthPanel() {
   const [window, setWindow] = useState<GatewayDispatchWindow>("5m")
   const stats = useGatewayDispatchStats(window)
   const groups = stats.data?.groups ?? []
-  const summary = useMemo(() => {
-    let routes = 0
-    let attempts = 0
-    for (const group of groups) {
-      routes += group.routes.length
-      attempts += group.routes.reduce((sum, route) => sum + route.total_attempts, 0)
-    }
-    return { routes, attempts }
-  }, [groups])
+  const routeCount = useMemo(
+    () => groups.reduce((sum, group) => sum + group.routes.length, 0),
+    [groups],
+  )
 
   return (
-    <Card className="overflow-hidden border border-border py-4 shadow-none sm:py-6">
-      <CardHeader className="gap-3 px-4 pb-3 sm:flex sm:flex-row sm:items-center sm:justify-between sm:px-6">
+    <Card className="overflow-hidden border border-border py-3 shadow-none sm:py-4">
+      <CardHeader className="gap-2 px-4 pb-2 sm:flex sm:flex-row sm:items-center sm:justify-between sm:px-5">
         <div className="min-w-0">
           <CardTitle className="flex items-center gap-2 text-base font-semibold">
             <Activity className="size-4 text-brand" />
@@ -43,7 +39,7 @@ export function DispatchHealthPanel() {
           </CardTitle>
           <p className="mt-1 text-xs text-muted-foreground">
             {groups.length > 0
-              ? `${groups.length} 个网关组 · ${summary.routes} 条活跃路由 · ${summary.attempts} 次尝试`
+              ? `${groups.length} 个网关组 · ${routeCount} 条活跃路由`
               : "按路由尝试统计失败率与平均首字时间"}
           </p>
         </div>
@@ -91,77 +87,55 @@ export function DispatchHealthPanel() {
         ) : (
           <div className="divide-y divide-border border-t border-border">
             {groups.map((group) => {
-              const attempts = group.routes.reduce((sum, route) => sum + route.total_attempts, 0)
               return (
                 <section key={group.gateway_group_id} aria-labelledby={`dispatch-group-${group.gateway_group_id}`}>
-                  <div className="flex items-center justify-between gap-3 bg-muted/20 px-4 py-2.5 sm:px-6">
+                  <div className="flex items-center justify-between gap-3 px-4 py-2.5 sm:px-5">
                     <div className="flex min-w-0 items-center gap-2">
                       <span className="size-2 shrink-0 rounded-full bg-brand" />
                       <h3 id={`dispatch-group-${group.gateway_group_id}`} className="truncate text-sm font-semibold text-foreground">
                         {group.gateway_group_name}
                       </h3>
                     </div>
-                    <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                      {group.routes.length} 条路由 · {attempts} 次尝试
-                    </span>
+                    <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{group.routes.length} 条路由</span>
                   </div>
 
-                  <div className="overflow-x-auto">
-                    <table className="w-full min-w-160 table-fixed text-left">
-                      <thead>
-                        <tr className="border-t border-border/70 text-[11px] text-muted-foreground">
-                          <th className="w-[46%] px-4 py-2 font-medium sm:px-6">路由</th>
-                          <th className="w-[16%] px-3 py-2 text-right font-medium">尝试次数</th>
-                          <th className="w-[18%] px-3 py-2 text-right font-medium">失败率</th>
-                          <th className="w-[20%] px-4 py-2 text-right font-medium sm:px-6">平均首字时间</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-border/70">
-                        {group.routes.map((route) => {
-                          const tone = failureRateTone(route.failure_rate)
-                          return (
-                            <tr key={route.route_id} className="hover:bg-muted/15">
-                              <td className="px-4 py-3 sm:px-6">
-                                <div className="flex min-w-0 items-center gap-2.5">
-                                  <div className="flex size-7 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
-                                    <Route className="size-3.5" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <p className="truncate text-sm font-medium text-foreground">{route.route_name}</p>
-                                    <p className="truncate text-xs text-muted-foreground">
-                                      {route.provider_name || "未记录上游名称"}
-                                    </p>
-                                  </div>
-                                </div>
-                              </td>
-                              <td className="px-3 py-3 text-right text-sm tabular-nums text-foreground">
-                                {route.total_attempts}
-                              </td>
-                              <td className="px-3 py-3 text-right">
-                                <span
-                                  className={cn(
-                                    "inline-flex min-w-16 justify-center rounded px-2 py-1 text-xs font-semibold tabular-nums ring-1 ring-inset",
-                                    failureToneClass[tone],
-                                  )}
-                                  title={`${route.failed_attempts} / ${route.total_attempts} 次失败`}
-                                >
-                                  {formatFailureRate(route.failure_rate)}
-                                </span>
-                              </td>
-                              <td className="px-4 py-3 text-right sm:px-6">
-                                <div className="inline-flex items-center justify-end gap-1.5 text-sm tabular-nums text-foreground">
-                                  <Timer className="size-3.5 text-muted-foreground" />
-                                  {formatFirstToken(route.average_first_token_ms)}
-                                </div>
-                                <p className="mt-0.5 text-[10px] tabular-nums text-muted-foreground">
-                                  {route.first_token_samples > 0 ? `${route.first_token_samples} 个样本` : "无首字样本"}
-                                </p>
-                              </td>
-                            </tr>
-                          )
-                        })}
-                      </tbody>
-                    </table>
+                  <div className="grid gap-2 px-4 pb-3 sm:grid-cols-2 sm:px-5 sm:pb-4 xl:grid-cols-3">
+                    {group.routes.map((route) => {
+                      const tone = failureRateTone(route.failure_rate)
+                      return (
+                        <div
+                          key={route.route_id}
+                          className="flex min-w-0 items-center justify-between gap-3 rounded-md border border-border/70 bg-muted/10 px-3 py-2"
+                          title={formatDispatchRouteMetric(route)}
+                        >
+                          <div className="flex min-w-0 items-center gap-2">
+                            <div className="flex size-6 shrink-0 items-center justify-center rounded bg-muted text-muted-foreground">
+                              <Route className="size-3" />
+                            </div>
+                            <div className="min-w-0">
+                              <p className="truncate text-xs font-medium text-foreground">{route.route_name}</p>
+                              <p className="truncate text-[11px] text-muted-foreground">
+                                {route.provider_name || "未记录上游名称"}
+                              </p>
+                            </div>
+                          </div>
+                          <div className="shrink-0 text-right">
+                            <span
+                              className={cn(
+                                "inline-flex rounded px-1.5 py-0.5 text-[11px] font-semibold tabular-nums ring-1 ring-inset",
+                                failureToneClass[tone],
+                              )}
+                            >
+                              {formatFailureRate(route.failure_rate)}
+                            </span>
+                            <p className="mt-1 inline-flex items-center gap-1 text-[11px] tabular-nums text-muted-foreground">
+                              <Timer className="size-3" />
+                              {formatFirstToken(route.average_first_token_ms)}
+                            </p>
+                          </div>
+                        </div>
+                      )
+                    })}
                   </div>
                 </section>
               )
