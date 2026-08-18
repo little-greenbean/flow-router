@@ -62,6 +62,7 @@ func registerGatewayAdmin(g *gin.RouterGroup, d *Deps) {
 		gp.POST("/providers/:id/reveal", func(c *gin.Context) { revealGatewayProvider(c, d) })
 
 		// usage
+		gp.GET("/dispatch/stats", func(c *gin.Context) { statsGatewayDispatch(c, d) })
 		gp.GET("/usage", func(c *gin.Context) { listGatewayUsage(c, d) })
 		gp.GET("/usage/stats", func(c *gin.Context) { statsGatewayUsage(c, d) })
 		gp.GET("/usage/models", func(c *gin.Context) { listGatewayUsageModels(c, d) })
@@ -73,6 +74,51 @@ func registerGatewayAdmin(g *gin.RouterGroup, d *Deps) {
 		gp.PUT("/prices", func(c *gin.Context) { upsertGatewayPrice(c, d) })
 		gp.DELETE("/prices/:id", func(c *gin.Context) { deleteGatewayPrice(c, d) })
 	}
+}
+
+var dispatchWindowDurations = map[string]time.Duration{
+	"1m":  time.Minute,
+	"5m":  5 * time.Minute,
+	"30m": 30 * time.Minute,
+	"1h":  time.Hour,
+	"4h":  4 * time.Hour,
+	"8h":  8 * time.Hour,
+	"12h": 12 * time.Hour,
+	"24h": 24 * time.Hour,
+}
+
+func parseDispatchWindow(raw string) (string, time.Duration, bool) {
+	window := strings.ToLower(strings.TrimSpace(raw))
+	if window == "" {
+		window = "5m"
+	}
+	duration, ok := dispatchWindowDurations[window]
+	return window, duration, ok
+}
+
+func statsGatewayDispatch(c *gin.Context, d *Deps) {
+	if d.GatewayUsage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage storage unavailable"})
+		return
+	}
+	window, duration, ok := parseDispatchWindow(c.Query("window"))
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid dispatch window"})
+		return
+	}
+	to := time.Now().UTC()
+	from := to.Add(-duration)
+	groups, err := d.GatewayUsage.DispatchStats(from, to)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"window": window,
+		"from":   from.Format(time.RFC3339Nano),
+		"to":     to.Format(time.RFC3339Nano),
+		"groups": groups,
+	})
 }
 
 func listGatewayProviders(c *gin.Context, d *Deps) {
