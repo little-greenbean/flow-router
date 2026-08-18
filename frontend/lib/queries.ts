@@ -11,6 +11,8 @@ import type {
   ChannelPage,
   CostTrendPoint,
   DashboardSummary,
+  GatewayDispatchStats,
+  GatewayDispatchWindow,
   GatewayUsageStats,
   NotificationChannel,
   NotificationLogPage,
@@ -146,6 +148,10 @@ export function useGatewayUsageStatsToday() {
   const { from, to } = localDayRangeISO()
   const qs = new URLSearchParams({ from, to })
   return useApi<GatewayUsageStats>(`/gateway/usage/stats?${qs}`)
+}
+
+export function useGatewayDispatchStats(window: GatewayDispatchWindow) {
+  return useApi<GatewayDispatchStats>(`/gateway/dispatch/stats?window=${window}`)
 }
 
 export function useAppVersion() {

@@ -886,6 +886,32 @@ export interface GatewayUsageStats {
   endpoints: { endpoint: string; requests: number }[]
 }
 
+export type GatewayDispatchWindow = "1m" | "5m" | "30m" | "1h" | "4h" | "8h" | "12h" | "24h"
+
+export interface GatewayDispatchStatsRoute {
+  route_id: number
+  route_name: string
+  provider_name?: string
+  total_attempts: number
+  failed_attempts: number
+  failure_rate: number
+  first_token_samples: number
+  average_first_token_ms: number | null
+}
+
+export interface GatewayDispatchStatsGroup {
+  gateway_group_id: number
+  gateway_group_name: string
+  routes: GatewayDispatchStatsRoute[]
+}
+
+export interface GatewayDispatchStats {
+  window: GatewayDispatchWindow
+  from: string
+  to: string
+  groups: GatewayDispatchStatsGroup[]
+}
+
 /** 使用记录模型下拉：后端按 requested_model 聚合 */
 export interface GatewayUsageModelOption {
   model: string
