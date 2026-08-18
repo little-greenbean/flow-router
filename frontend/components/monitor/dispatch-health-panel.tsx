@@ -35,7 +35,7 @@ export function DispatchHealthPanel() {
 
   return (
     <Card className="overflow-hidden border border-border py-4 shadow-none sm:py-6">
-      <CardHeader className="gap-3 px-4 pb-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+      <CardHeader className="gap-3 px-4 pb-3 sm:flex sm:flex-row sm:items-center sm:justify-between sm:px-6">
         <div className="min-w-0">
           <CardTitle className="flex items-center gap-2 text-base font-semibold">
             <Activity className="size-4 text-brand" />
