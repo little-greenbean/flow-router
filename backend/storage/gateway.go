@@ -3,6 +3,7 @@ package storage
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -588,44 +589,74 @@ type GatewayDispatchStatsGroup struct {
 
 // GatewayDispatchStatsRoute 是单条路由在时间窗口内的尝试聚合结果。
 type GatewayDispatchStatsRoute struct {
-	RouteID             uint     `json:"route_id"`
-	RouteName           string   `json:"route_name"`
-	ProviderName        string   `json:"provider_name,omitempty"`
-	TotalAttempts       int64    `json:"total_attempts"`
-	FailedAttempts      int64    `json:"failed_attempts"`
-	FailureRate         float64  `json:"failure_rate"`
-	FirstTokenSamples   int64    `json:"first_token_samples"`
-	AverageFirstTokenMS *float64 `json:"average_first_token_ms"`
+	RouteID               uint     `json:"route_id"`
+	RouteName             string   `json:"route_name"`
+	ProviderName          string   `json:"provider_name,omitempty"`
+	SourceAPIKeyName      string   `json:"source_api_key_name,omitempty"`
+	SourceGroupName       string   `json:"source_group_name,omitempty"`
+	BillingRateMultiplier float64  `json:"billing_rate_multiplier"`
+	RouteAvailable        bool     `json:"route_available"`
+	TotalAttempts         int64    `json:"total_attempts"`
+	FailedAttempts        int64    `json:"failed_attempts"`
+	FailureRate           float64  `json:"failure_rate"`
+	FirstTokenSamples     int64    `json:"first_token_samples"`
+	AverageFirstTokenMS   *float64 `json:"average_first_token_ms"`
 }
 
 // DispatchStats 按网关组和路由聚合窗口内的每次调度尝试。
 // from/to 使用半开区间 [from, to)，调用方应传入同一时区的时间。
 func (r *GatewayUsageLogs) DispatchStats(from, to time.Time) ([]GatewayDispatchStatsGroup, error) {
 	type aggregateRow struct {
-		GatewayGroupID      uint
-		RouteID             uint
-		ProviderName        string
-		TotalAttempts       int64
-		FailedAttempts      int64
-		FirstTokenSamples   int64
-		AverageFirstTokenMS *float64
+		GatewayGroupID       uint
+		RouteID              uint
+		ProviderName         string
+		SourceAPIKeyName     string
+		SourceGroupName      string
+		LoggedBillingRate    float64
+		LoggedRateMultiplier float64
+		TotalAttempts        int64
+		FailedAttempts       int64
+		FirstTokenSamples    int64
+		AverageFirstTokenMS  *float64
 	}
 
 	var rows []aggregateRow
-	query := r.db.Model(&GatewayUsageLog{}).
-		Select(`
-			gateway_group_id,
-			route_id,
-			MAX(provider_name) AS provider_name,
-			COUNT(*) AS total_attempts,
-			COALESCE(SUM(CASE WHEN success = ? THEN 1 ELSE 0 END), 0) AS failed_attempts,
-			COUNT(first_token_ms) AS first_token_samples,
-			AVG(first_token_ms) AS average_first_token_ms
-		`, false).
-		Where("created_at >= ? AND created_at < ?", from, to).
-		Group("gateway_group_id, route_id").
-		Order("gateway_group_id ASC, route_id ASC")
-	if err := query.Scan(&rows).Error; err != nil {
+	if err := r.db.Raw(`
+		WITH window_logs AS (
+			SELECT id, gateway_group_id, route_id, provider_name, source_api_key_name,
+				source_group_name, billing_rate_multiplier, rate_multiplier, success,
+				first_token_ms, created_at
+			FROM gateway_usage_logs
+			WHERE created_at >= ? AND created_at < ?
+		), aggregated AS (
+			SELECT gateway_group_id, route_id,
+				COUNT(*) AS total_attempts,
+				COALESCE(SUM(CASE WHEN success = ? THEN 1 ELSE 0 END), 0) AS failed_attempts,
+				COUNT(first_token_ms) AS first_token_samples,
+				AVG(first_token_ms) AS average_first_token_ms
+			FROM window_logs
+			GROUP BY gateway_group_id, route_id
+		), latest AS (
+			SELECT gateway_group_id, route_id, provider_name, source_api_key_name,
+				source_group_name, billing_rate_multiplier, rate_multiplier,
+				ROW_NUMBER() OVER (
+					PARTITION BY gateway_group_id, route_id
+					ORDER BY created_at DESC, id DESC
+				) AS row_num
+			FROM window_logs
+		)
+		SELECT aggregated.gateway_group_id, aggregated.route_id,
+			latest.provider_name, latest.source_api_key_name, latest.source_group_name,
+			COALESCE(latest.billing_rate_multiplier, 0) AS logged_billing_rate,
+			COALESCE(latest.rate_multiplier, 0) AS logged_rate_multiplier,
+			aggregated.total_attempts, aggregated.failed_attempts,
+			aggregated.first_token_samples, aggregated.average_first_token_ms
+		FROM aggregated
+		JOIN latest ON latest.gateway_group_id = aggregated.gateway_group_id
+			AND latest.route_id = aggregated.route_id
+			AND latest.row_num = 1
+		ORDER BY aggregated.gateway_group_id ASC, aggregated.route_id ASC
+	`, from, to, false).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
@@ -653,6 +684,21 @@ func (r *GatewayUsageLogs) DispatchStats(from, to time.Time) ([]GatewayDispatchS
 		groupNameByID[group.ID] = group.Name
 	}
 
+	// 路由表是当前调度配置的权威成本来源。日志中的倍率只作为已删除路由
+	// 的历史回退，避免路由重配后面板顺序被旧请求污染。
+	routeIDs := make([]uint, 0, len(rows))
+	for _, row := range rows {
+		routeIDs = append(routeIDs, row.RouteID)
+	}
+	var routeConfigs []GatewayRoute
+	if err := r.db.Where("id IN ?", routeIDs).Find(&routeConfigs).Error; err != nil {
+		return nil, err
+	}
+	routeConfigByID := make(map[uint]GatewayRoute, len(routeConfigs))
+	for _, route := range routeConfigs {
+		routeConfigByID[route.ID] = route
+	}
+
 	groups := make([]GatewayDispatchStatsGroup, 0, len(groupIDs))
 	groupIndex := make(map[uint]int, len(groupIDs))
 	for _, id := range groupIDs {
@@ -672,19 +718,67 @@ func (r *GatewayUsageLogs) DispatchStats(from, to time.Time) ([]GatewayDispatchS
 		if row.TotalAttempts > 0 {
 			failureRate = float64(row.FailedAttempts) / float64(row.TotalAttempts)
 		}
-		groups[groupIndex[row.GatewayGroupID]].Routes = append(
-			groups[groupIndex[row.GatewayGroupID]].Routes,
-			GatewayDispatchStatsRoute{
-				RouteID:             row.RouteID,
-				RouteName:           fmt.Sprintf("路由 #%d", row.RouteID),
-				ProviderName:        strings.TrimSpace(row.ProviderName),
-				TotalAttempts:       row.TotalAttempts,
-				FailedAttempts:      row.FailedAttempts,
-				FailureRate:         failureRate,
-				FirstTokenSamples:   row.FirstTokenSamples,
-				AverageFirstTokenMS: row.AverageFirstTokenMS,
-			},
-		)
+		providerName := strings.TrimSpace(row.ProviderName)
+		sourceAPIKeyName := strings.TrimSpace(row.SourceAPIKeyName)
+		sourceGroupName := strings.TrimSpace(row.SourceGroupName)
+		billingRate := row.LoggedBillingRate
+		route, routeAvailable := routeConfigByID[row.RouteID]
+		if routeAvailable {
+			if currentName := strings.TrimSpace(route.SourceAPIKeyName); currentName != "" {
+				sourceAPIKeyName = currentName
+			}
+			if currentGroup := strings.TrimSpace(route.SourceGroupName); currentGroup != "" {
+				sourceGroupName = currentGroup
+			}
+			if billingRate = route.BillingRateMultiplier; billingRate <= 0 {
+				billingRate = row.LoggedBillingRate
+			}
+		}
+		if billingRate <= 0 {
+			billingRate = row.LoggedRateMultiplier
+		}
+		if billingRate <= 0 {
+			billingRate = 1
+		}
+		if sourceAPIKeyName == "" {
+			sourceAPIKeyName = providerName
+		}
+		if sourceGroupName == "" {
+			sourceGroupName = providerName
+		}
+		routeName := sourceAPIKeyName
+		if routeName == "" {
+			routeName = sourceGroupName
+		}
+		if routeName == "" {
+			routeName = "未命名来源"
+		}
+		groups[groupIndex[row.GatewayGroupID]].Routes = append(groups[groupIndex[row.GatewayGroupID]].Routes, GatewayDispatchStatsRoute{
+			RouteID:               row.RouteID,
+			RouteName:             routeName,
+			ProviderName:          providerName,
+			SourceAPIKeyName:      sourceAPIKeyName,
+			SourceGroupName:       sourceGroupName,
+			BillingRateMultiplier: billingRate,
+			RouteAvailable:        routeAvailable,
+			TotalAttempts:         row.TotalAttempts,
+			FailedAttempts:        row.FailedAttempts,
+			FailureRate:           failureRate,
+			FirstTokenSamples:     row.FirstTokenSamples,
+			AverageFirstTokenMS:   row.AverageFirstTokenMS,
+		})
+	}
+	for i := range groups {
+		sort.SliceStable(groups[i].Routes, func(a, b int) bool {
+			left, right := groups[i].Routes[a], groups[i].Routes[b]
+			if left.BillingRateMultiplier != right.BillingRateMultiplier {
+				return left.BillingRateMultiplier < right.BillingRateMultiplier
+			}
+			if left.RouteID != right.RouteID {
+				return left.RouteID < right.RouteID
+			}
+			return left.RouteName < right.RouteName
+		})
 	}
 	return groups, nil
 }

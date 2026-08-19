@@ -1,11 +1,22 @@
-# UpstreamOps
+# Flow Router
 
 [English](README.md) | [简体中文](README.zh.md)
 
-> 本项目基于 [worryzyy/upstream-hub](https://github.com/worryzyy/upstream-hub) 二次开发，感谢原作者 [@worryzyy](https://github.com/worryzyy) 的开源工作。
+> Flow Router 是基于开源项目 [UpstreamOps](https://github.com/bejix/upstream-ops) 的二次开发项目，而 UpstreamOps 本身基于 [worryzyy/upstream-hub](https://github.com/worryzyy/upstream-hub)。感谢上游维护者和原作者的开源工作。
 
-> UpstreamOps 是一个面向 NewAPI / Sub2API 上游站点的集中监控与运维面板，用来统一管理上游账号、查看余额与消费、同步模型倍率、追踪倍率变化、维护上游 API Key、发起充值/兑换，并通过多种通知渠道推送余额告警、倍率变更、登录异常、监控异常和上游公告。
+> Flow Router 是一个面向 NewAPI / Sub2API 上游站点的集中监控、运维与请求调度面板，用来统一管理上游账号、查看余额与消费、同步模型倍率、追踪倍率变化、维护上游 API Key、发起充值/兑换，并通过多种通知渠道推送余额告警、倍率变更、登录异常、监控异常和上游公告。
 同时内置 OpenAI / Claude / Responses 兼容的请求转发网关：可创建网关密钥、绑定同步渠道或直连上游、按倍率与权重调度、协议互转、故障自动切换，并记录每次请求的用量与费用参考。
+
+## Flow Router 当前优化
+
+这个 Fork 当前重点包含两项实用优化：
+
+- **最新模型适配：** 网关组模型页可以读取 Sub2API 兼容的公开模型目录，并把目录中新列出的模型绑定到选中的 NewAPI 或 Sub2API 路由，减少本地模型选择器缺少模型的问题；模型声明不替代上游可用性探测。
+- **调度情况展示：** 首页按网关组展示路由调用量、失败率、平均首字时间，支持多个时间窗口切换；路由按成本从低到高排序，点击来源名称可以直接跳转到对应的渠道路由并高亮。
+
+### TODO：引入 AI 辅助调度
+
+当前调度仍以确定性的规则为主。后续计划引入 AI 作为决策层，根据路由健康度、延迟、失败率和成本动态调整路由权重；现有规则和故障切换机制仍会作为基础与兜底，避免 AI 成为单点故障。
 
 
 ## ❤️赞助商
@@ -24,11 +35,11 @@
 
 </details>
 
-## 为什么使用？
+## 为什么使用 Flow Router？
 
 当你同时维护多个 NewAPI / Sub2API 上游时，余额、消费、倍率、公告、API Key、订阅、充值入口和下游同步配置通常分散在不同后台。人工逐个登录检查不仅重复，而且很容易漏掉余额不足、倍率调整、登录失效、订阅即将到期或上游公告。
 
-UpstreamOps 主要解决这些痛点：
+Flow Router 主要解决这些痛点：
 
 - 集中看状态：把多个上游的余额、消费、倍率、公告、订阅和异常状态放到一个面板里。
 - 减少人工巡检：定时同步余额、消费、倍率和订阅用量，不需要反复打开不同后台。

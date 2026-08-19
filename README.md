@@ -1,12 +1,23 @@
-# UpstreamOps
+# Flow Router
 
 [English](README.md) | [简体中文](README.zh.md)
 
-> UpstreamOps is a centralized monitoring and operations dashboard for NewAPI and Sub2API upstream sites. It helps manage upstream accounts, balances, spending, model or group rates, rate changes, upstream API keys, recharge and redeem workflows, subscriptions, announcements, and notification alerts.
+> Flow Router is a centralized monitoring and request-routing dashboard for NewAPI and Sub2API upstream sites. It helps manage upstream accounts, balances, spending, model or group rates, rate changes, upstream API keys, recharge and redeem workflows, subscriptions, announcements, and notification alerts.
 
 It also includes an OpenAI / Claude / Responses compatible request gateway: create gateway API keys, bind monitored channels or direct providers, schedule by rate and weight, convert protocols, fail over on errors, and record per-request usage and cost estimates.
 
-> This project is based on [worryzyy/upstream-hub](https://github.com/worryzyy/upstream-hub). Thanks to [@worryzyy](https://github.com/worryzyy) for the original open-source work.
+> Flow Router is a second-development fork based on the open-source [UpstreamOps](https://github.com/bejix/upstream-ops) project, which itself is based on [worryzyy/upstream-hub](https://github.com/worryzyy/upstream-hub). Thanks to the upstream maintainers and original authors for their open-source work.
+
+## Flow Router Updates
+
+This fork currently focuses on two practical improvements:
+
+- **Latest model compatibility:** the gateway group model page can pull a Sub2API-compatible public model catalog and bind newly listed models to selected NewAPI or Sub2API routes, reducing missing-model issues in the local selector. This declaration does not replace an upstream availability probe.
+- **Dispatch visibility:** the home dashboard shows per-gateway-group route calls, failure rates, average first-token latency, selectable time windows, cost-ordered routes, and clickable links to the matching channel route.
+
+### TODO: AI-assisted scheduling
+
+The current scheduler remains deterministic and rule-based. A future version will introduce AI as a decision layer that evaluates route health, latency, failure rate, and cost, then adjusts route weights. The existing rules and failover path will remain the baseline and fallback so that AI decisions do not become a single point of failure.
 
 ## Sponsor
 
@@ -22,11 +33,11 @@ It also includes an OpenAI / Claude / Responses compatible request gateway: crea
 
 </details>
 
-## Why Use UpstreamOps
+## Why Use Flow Router
 
 When you maintain multiple NewAPI or Sub2API upstream accounts, balance, spending, rates, announcements, API keys, subscriptions, and recharge entry points are usually scattered across different admin panels. Manually logging in one by one is repetitive and can easily miss low balances, rate changes, login failures, expiring subscriptions, or upstream announcements.
 
-UpstreamOps focuses on these problems:
+Flow Router focuses on these problems:
 
 - Centralized status view: balances, spending, rates, announcements, subscriptions, and abnormal states across multiple upstreams.
 - Less manual checking: scheduled balance, spending, rate, and subscription usage synchronization.

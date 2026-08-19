@@ -205,6 +205,7 @@ type RoutesPanelProps = {
   onEnsureKeys: () => void
   onClearRoutePause: (routeID?: number) => void
   onShowPauseError: (route: Partial<GatewayRoute>) => void
+  highlightedRouteID?: number | null
 }
 
 export function RoutesPanel({
@@ -225,6 +226,7 @@ export function RoutesPanel({
   onEnsureKeys,
   onClearRoutePause,
   onShowPauseError,
+  highlightedRouteID,
 }: RoutesPanelProps) {
   return (
     <div className="space-y-4">
@@ -331,7 +333,15 @@ export function RoutesPanel({
                 ? r.user_agent_mode
                 : "passthrough"
             return (
-              <TableRow key={r.id ?? `new-${idx}`}>
+              <TableRow
+                key={r.id ?? `new-${idx}`}
+                id={r.id ? `gateway-route-${r.id}` : undefined}
+                className={cn(
+                  "transition-colors duration-300",
+                  highlightedRouteID === r.id &&
+                    "bg-primary/10 shadow-[inset_3px_0_0_hsl(var(--primary))] ring-1 ring-inset ring-primary/40",
+                )}
+              >
                 <TableCell>
                   <Select
                     value={kind}

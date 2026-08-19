@@ -892,6 +892,10 @@ export interface GatewayDispatchStatsRoute {
   route_id: number
   route_name: string
   provider_name?: string
+  source_api_key_name?: string
+  source_group_name?: string
+  billing_rate_multiplier?: number
+  route_available?: boolean
   total_attempts: number
   failed_attempts: number
   failure_rate: number

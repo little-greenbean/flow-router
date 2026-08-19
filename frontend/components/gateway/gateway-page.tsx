@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
 import {
   DollarSign,
@@ -95,11 +96,13 @@ import {
 
 export function GatewayPage() {
   const { confirm, dialog: confirmDialog } = useConfirm()
+  const [searchParams] = useSearchParams()
   const channels = useChannels()
   const channelList = channels.data ?? []
 
   const [groups, setGroups] = useState<GatewayGroup[]>([])
   const [selectedGroupID, setSelectedGroupID] = useState<number | null>(null)
+  const [highlightedRouteID, setHighlightedRouteID] = useState<number | null>(null)
   const [mainTab, setMainTab] = useState<MainTab>("gateway")
   const [configTab, setConfigTab] = useState<ConfigTab>("keys")
   const [loading, setLoading] = useState(false)
@@ -108,6 +111,9 @@ export function GatewayPage() {
   const [groupLoading, setGroupLoading] = useState(false)
   /** 切换组时递增，丢弃过期请求结果，避免旧组数据覆盖新组 */
   const loadSeqRef = useRef(0)
+  const routeHighlightKeyRef = useRef<string | null>(null)
+  const routeScrollTimerRef = useRef<number | null>(null)
+  const routeHighlightTimerRef = useRef<number | null>(null)
 
   const [groupDialogOpen, setGroupDialogOpen] = useState(false)
   const [editingGroup, setEditingGroup] = useState<GatewayGroup | null>(null)
@@ -202,6 +208,15 @@ export function GatewayPage() {
     () => groups.find((g) => g.id === selectedGroupID) ?? null,
     [groups, selectedGroupID],
   )
+
+  const targetGroupID = useMemo(() => {
+    const value = Number(searchParams.get("group"))
+    return Number.isInteger(value) && value > 0 ? value : null
+  }, [searchParams])
+  const targetRouteID = useMemo(() => {
+    const value = Number(searchParams.get("route"))
+    return Number.isInteger(value) && value > 0 ? value : null
+  }, [searchParams])
 
   const channelNameByID = useMemo(() => {
     const m = new Map<number, string>()
@@ -696,6 +711,44 @@ export function GatewayPage() {
   useEffect(() => {
     void refreshUsageKeys(usageGroupFilter, groups)
   }, [usageGroupFilter, groups, refreshUsageKeys])
+
+  // 调度面板深链接：先切组，再切到渠道路由标签。
+  useEffect(() => {
+    if (!targetGroupID || !groups.some((group) => group.id === targetGroupID)) return
+    if (selectedGroupID !== targetGroupID) setSelectedGroupID(targetGroupID)
+    setConfigTab("routes")
+  }, [groups, selectedGroupID, targetGroupID])
+
+  // 路由详情异步加载完成后滚动定位，并短暂保留视觉高亮。
+  useEffect(() => {
+    if (
+      !targetRouteID ||
+      !targetGroupID ||
+      selectedGroupID !== targetGroupID ||
+      !routeDrafts.some((route) => Number(route.id) === targetRouteID)
+    ) {
+      return
+    }
+    const highlightKey = `${targetGroupID}:${targetRouteID}`
+    if (routeHighlightKeyRef.current === highlightKey) return
+    routeHighlightKeyRef.current = highlightKey
+    setConfigTab("routes")
+    setHighlightedRouteID(targetRouteID)
+    if (routeScrollTimerRef.current !== null) window.clearTimeout(routeScrollTimerRef.current)
+    if (routeHighlightTimerRef.current !== null) window.clearTimeout(routeHighlightTimerRef.current)
+    routeScrollTimerRef.current = window.setTimeout(() => {
+      document.getElementById(`gateway-route-${targetRouteID}`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      })
+    }, 80)
+    routeHighlightTimerRef.current = window.setTimeout(() => setHighlightedRouteID(null), 2600)
+  }, [routeDrafts, selectedGroupID, targetGroupID, targetRouteID])
+
+  useEffect(() => () => {
+    if (routeScrollTimerRef.current !== null) window.clearTimeout(routeScrollTimerRef.current)
+    if (routeHighlightTimerRef.current !== null) window.clearTimeout(routeHighlightTimerRef.current)
+  }, [])
 
   useEffect(() => {
     if (!selectedGroup) {
@@ -1681,6 +1734,7 @@ export function GatewayPage() {
                         onEnsureKeys={() => void ensureKeys()}
                         onClearRoutePause={(id) => void clearRoutePause(id)}
                         onShowPauseError={setPauseErrorRoute}
+                        highlightedRouteID={highlightedRouteID}
                       />
                     </TabsContent>
 

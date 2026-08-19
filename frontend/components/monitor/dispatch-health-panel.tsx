@@ -2,25 +2,40 @@
 
 import { useMemo, useState } from "react"
 import { Activity, Route, Timer } from "lucide-react"
+import { useNavigate } from "react-router-dom"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useGatewayDispatchStats } from "@/lib/queries"
 import type { GatewayDispatchWindow } from "@/lib/api-types"
 import { cn } from "@/lib/utils"
 import {
   DISPATCH_WINDOW_OPTIONS,
+  chunkDispatchGroups,
   failureRateTone,
   formatDispatchRouteMetric,
+  formatDispatchRouteSource,
+  formatDispatchRouteGroup,
+  formatBillingRate,
+  dispatchRoutePath,
   formatFailureRate,
   formatFirstToken,
+  metricBarPercent,
+  isDispatchRouteNavigable,
 } from "@/components/monitor/dispatch-health-utils"
 
-const failureToneClass = {
-  success: "bg-success/10 text-success ring-success/20",
-  warning: "bg-warning/10 text-warning ring-warning/20",
-  danger: "bg-danger/10 text-danger ring-danger/20",
+const failureTextClass = {
+  success: "text-success",
+  warning: "text-warning",
+  danger: "text-danger",
+}
+
+const failureBarClass = {
+  success: "bg-success",
+  warning: "bg-warning",
+  danger: "bg-danger",
 }
 
 export function DispatchHealthPanel() {
+  const navigate = useNavigate()
   const [window, setWindow] = useState<GatewayDispatchWindow>("5m")
   const stats = useGatewayDispatchStats(window)
   const groups = stats.data?.groups ?? []
@@ -30,16 +45,16 @@ export function DispatchHealthPanel() {
   )
 
   return (
-    <Card className="overflow-hidden border border-border py-3 shadow-none sm:py-4">
-      <CardHeader className="gap-2 px-4 pb-2 sm:flex sm:flex-row sm:items-center sm:justify-between sm:px-5">
+    <Card className="overflow-hidden border border-border py-2 shadow-none sm:py-3">
+      <CardHeader className="gap-1.5 px-3 pb-1.5 sm:flex sm:flex-row sm:items-center sm:justify-between sm:px-4">
         <div className="min-w-0">
-          <CardTitle className="flex items-center gap-2 text-base font-semibold">
-            <Activity className="size-4 text-brand" />
+          <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
+            <Activity className="size-3.5 text-brand" />
             调度情况
           </CardTitle>
-          <p className="mt-1 text-xs text-muted-foreground">
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
             {groups.length > 0
-              ? `${groups.length} 个网关组 · ${routeCount} 条活跃路由`
+              ? `${groups.length} 个网关组 · ${routeCount} 条统计路由`
               : "按路由尝试统计失败率与平均首字时间"}
           </p>
         </div>
@@ -56,7 +71,7 @@ export function DispatchHealthPanel() {
                   aria-checked={active}
                   onClick={() => setWindow(option.value)}
                   className={cn(
-                    "h-7 rounded px-2.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    "h-6 rounded px-2 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                     active
                       ? "bg-background text-foreground shadow-sm ring-1 ring-border"
                       : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
@@ -85,61 +100,119 @@ export function DispatchHealthPanel() {
             <p className="text-sm">当前时间窗口暂无调度记录</p>
           </div>
         ) : (
-          <div className="divide-y divide-border border-t border-border">
-            {groups.map((group) => {
-              return (
-                <section key={group.gateway_group_id} aria-labelledby={`dispatch-group-${group.gateway_group_id}`}>
-                  <div className="flex items-center justify-between gap-3 px-4 py-2.5 sm:px-5">
-                    <div className="flex min-w-0 items-center gap-2">
-                      <span className="size-2 shrink-0 rounded-full bg-brand" />
-                      <h3 id={`dispatch-group-${group.gateway_group_id}`} className="truncate text-sm font-semibold text-foreground">
-                        {group.gateway_group_name}
-                      </h3>
+          <div className="space-y-2 border-t border-border px-2.5 py-2 sm:px-3">
+            {chunkDispatchGroups(groups).map((groupRow, rowIndex) => (
+              <div key={`dispatch-group-row-${rowIndex}`} className="grid min-w-0 gap-2 md:grid-cols-2 xl:grid-cols-3">
+                {groupRow.map((group) => {
+                  const groupAttempts = group.routes.reduce((sum, route) => sum + route.total_attempts, 0)
+                  return (
+                    <section
+                      key={group.gateway_group_id}
+                      aria-labelledby={`dispatch-group-${group.gateway_group_id}`}
+                      className="min-w-0 rounded-md border border-border bg-background"
+                    >
+                    <div className="flex items-center justify-between gap-2 border-b border-border bg-muted/20 px-2.5 py-1.5">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="size-1.5 shrink-0 rounded-full bg-brand" />
+                        <h3 id={`dispatch-group-${group.gateway_group_id}`} className="truncate text-xs font-semibold text-foreground">
+                          {group.gateway_group_name}
+                        </h3>
+                      </div>
+                      <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{group.routes.length} 条路由</span>
                     </div>
-                    <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{group.routes.length} 条路由</span>
-                  </div>
 
-                  <div className="grid gap-2 px-4 pb-3 sm:grid-cols-2 sm:px-5 sm:pb-4 xl:grid-cols-3">
-                    {group.routes.map((route) => {
-                      const tone = failureRateTone(route.failure_rate)
-                      return (
-                        <div
-                          key={route.route_id}
-                          className="flex min-w-0 items-center justify-between gap-3 rounded-md border border-border/70 bg-muted/10 px-3 py-2"
-                          title={formatDispatchRouteMetric(route)}
-                        >
-                          <div className="flex min-w-0 items-center gap-2">
-                            <div className="flex size-6 shrink-0 items-center justify-center rounded bg-muted text-muted-foreground">
-                              <Route className="size-3" />
-                            </div>
-                            <div className="min-w-0">
-                              <p className="truncate text-xs font-medium text-foreground">{route.route_name}</p>
-                              <p className="truncate text-[11px] text-muted-foreground">
-                                {route.provider_name || "未记录上游名称"}
-                              </p>
-                            </div>
-                          </div>
-                          <div className="shrink-0 text-right">
-                            <span
-                              className={cn(
-                                "inline-flex rounded px-1.5 py-0.5 text-[11px] font-semibold tabular-nums ring-1 ring-inset",
-                                failureToneClass[tone],
+                    <div className="divide-y divide-border">
+                      {group.routes.map((route) => {
+                        const tone = failureRateTone(route.failure_rate)
+                        const routeNavigable = isDispatchRouteNavigable(route)
+                        return (
+                          <div
+                            key={route.route_id}
+                            className="grid min-w-0 grid-cols-1 items-center gap-2 px-2.5 py-1.5 md:grid-cols-[minmax(110px,1fr)_minmax(165px,1.1fr)]"
+                            title={formatDispatchRouteMetric(route)}
+                          >
+                            <div className="flex min-w-0 items-center gap-2">
+                              <div className="flex size-5 shrink-0 items-center justify-center rounded bg-muted text-muted-foreground">
+                                <Route className="size-2.5" />
+                              </div>
+                              {routeNavigable ? (
+                                <button
+                                  type="button"
+                                  className="min-w-0 text-left outline-none focus-visible:rounded-sm focus-visible:ring-2 focus-visible:ring-ring/60"
+                                  onClick={() => navigate(dispatchRoutePath(group.gateway_group_id, route.route_id))}
+                                  title={`打开 ${formatDispatchRouteSource(route)} · 源分组 ${formatDispatchRouteGroup(route)}`}
+                                >
+                                  <p className="whitespace-normal break-words text-[11px] font-medium leading-4 text-foreground hover:text-brand">
+                                    {formatDispatchRouteSource(route)}
+                                  </p>
+                                  <p className="whitespace-normal break-words text-[10px] leading-3 text-muted-foreground">
+                                    源分组 {formatDispatchRouteGroup(route)} · 成本 {formatBillingRate(route.billing_rate_multiplier)}
+                                  </p>
+                                </button>
+                              ) : (
+                                <div className="min-w-0 text-left" title="历史路由，当前配置已删除">
+                                <p className="whitespace-normal break-words text-[11px] font-medium leading-4 text-foreground hover:text-brand">
+                                  {formatDispatchRouteSource(route)}
+                                </p>
+                                <p className="whitespace-normal break-words text-[10px] leading-3 text-muted-foreground">
+                                  历史路由 · {formatDispatchRouteGroup(route)} · 成本 {formatBillingRate(route.billing_rate_multiplier)}
+                                </p>
+                                </div>
                               )}
-                            >
-                              {formatFailureRate(route.failure_rate)}
-                            </span>
-                            <p className="mt-1 inline-flex items-center gap-1 text-[11px] tabular-nums text-muted-foreground">
-                              <Timer className="size-3" />
-                              {formatFirstToken(route.average_first_token_ms)}
-                            </p>
+                            </div>
+                            <div className="min-w-0 space-y-1">
+                              <div
+                                className="flex min-w-0 items-center gap-1.5"
+                                title={`调用 ${route.total_attempts} 次，占组内 ${metricBarPercent(route.total_attempts, groupAttempts)}%`}
+                              >
+                                <span className="shrink-0 text-[9px] text-muted-foreground">调用</span>
+                                <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+                                  <span
+                                    className="block h-full rounded-full bg-brand transition-[width]"
+                                    style={{ width: `${metricBarPercent(route.total_attempts, groupAttempts)}%` }}
+                                  />
+                                </div>
+                                <span className="shrink-0 text-[10px] font-semibold tabular-nums text-foreground">
+                                  {metricBarPercent(route.total_attempts, groupAttempts)}%
+                                </span>
+                              </div>
+                              <div className="flex min-w-0 items-center gap-1.5">
+                                <span className="shrink-0 text-[9px] text-muted-foreground">失败</span>
+                                <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+                                  <span
+                                    className={cn("block h-full rounded-full transition-[width]", failureBarClass[tone])}
+                                    style={{ width: `${metricBarPercent(route.failure_rate)}%` }}
+                                  />
+                                </div>
+                                <span className={cn("shrink-0 text-[10px] font-semibold tabular-nums", failureTextClass[tone])}>
+                                  {formatFailureRate(route.failure_rate)}
+                                </span>
+                              </div>
+                              <div className="flex min-w-0 items-center gap-1.5">
+                                <span className="inline-flex shrink-0 items-center gap-0.5 text-[9px] text-muted-foreground">
+                                  <Timer className="size-2.5" />
+                                  首字
+                                </span>
+                                <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+                                  <span
+                                    className="block h-full rounded-full bg-brand/70 transition-[width]"
+                                    style={{ width: `${metricBarPercent(route.average_first_token_ms, 1600)}%` }}
+                                  />
+                                </div>
+                                <span className="shrink-0 text-[10px] font-semibold tabular-nums text-foreground">
+                                  {formatFirstToken(route.average_first_token_ms)}
+                                </span>
+                              </div>
+                            </div>
                           </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                </section>
-              )
-            })}
+                        )
+                      })}
+                    </div>
+                    </section>
+                  )
+                })}
+              </div>
+            ))}
           </div>
         )}
       </CardContent>
