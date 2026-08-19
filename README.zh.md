@@ -25,9 +25,8 @@
 
 <table>
 <tr>
-<td width="180"><a href="https://cmzi.com/aff/CHTVTQWE"><img src="https://zhenxiansheng-1251032746.file.myqcloud.com/Markdown/2020/12/29/zi-yuan-32.png" alt="cmzi.com" width="150"></a></td>
-<td>感谢 触摸云 赞助了本项目！触摸云 是一家专注海外云计算服务的品牌，提供香港云服务器、美国高防云服务器、物理服务器、防御与加速 CDN、自研 CDN 系统等产品。触摸云为本软件用户提供了特别优惠，使用
-<a href="https://cmzi.com/aff/CHTVTQWE">此链接</a></td>
+<td><strong>FlowNode</strong></td>
+<td>感谢 FlowNode 对本项目的赞助。欢迎访问 <a href="https://flow-node.com">FlowNode 官网</a>。</td>
 </tr>
 
 

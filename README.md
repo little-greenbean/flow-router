@@ -26,8 +26,8 @@ The current scheduler remains deterministic and rule-based. A future version wil
 
 <table>
 <tr>
-<td width="180"><a href="https://cmzi.com/aff/CHTVTQWE"><img src="https://zhenxiansheng-1251032746.file.myqcloud.com/Markdown/2020/12/29/zi-yuan-32.png" alt="cmzi.com" width="150"></a></td>
-<td>Thanks to 触摸云 for sponsoring this project. 触摸云 provides overseas cloud computing services, including Hong Kong cloud servers, US high-defense servers, physical servers, protection services, acceleration CDN, and self-developed CDN systems. UpstreamOps users can use <a href="https://cmzi.com/aff/CHTVTQWE">this link</a>.</td>
+<td><strong>FlowNode</strong></td>
+<td>Thanks to FlowNode for sponsoring this project. Visit the <a href="https://flow-node.com">FlowNode official website</a>.</td>
 </tr>
 </table>
 
