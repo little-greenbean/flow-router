@@ -147,24 +147,24 @@ type Sub2APITokenCredential struct {
 //   - password: Password 必填；Username 为登录账号
 //   - token:    TokenCredential 必填（已序列化为 JSON 字符串）；Username 仅作展示备注
 type CreateInput struct {
-	Name                        string
-	Type                        storage.ChannelType
-	SiteURL                     string
-	Username                    string
-	SortOrder                   int
-	Password                    string
-	CredentialMode              storage.CredentialMode
-	TokenCredential             string // JSON：password 模式时为空
-	LoginExtraParams            string
-	TurnstileEnabled            bool
-	IgnoreAnnouncements         bool
-	SubscriptionEnabled         bool
-	ProxyEnabled                bool
-	CaptchaConfigID             *uint
-	BalanceThreshold            float64
-	RechargeMultiplier          *float64
-	RechargeMultiplierMode      string
-	MonitorEnabled              bool
+	Name                   string
+	Type                   storage.ChannelType
+	SiteURL                string
+	Username               string
+	SortOrder              int
+	Password               string
+	CredentialMode         storage.CredentialMode
+	TokenCredential        string // JSON：password 模式时为空
+	LoginExtraParams       string
+	TurnstileEnabled       bool
+	IgnoreAnnouncements    bool
+	SubscriptionEnabled    bool
+	ProxyEnabled           bool
+	CaptchaConfigID        *uint
+	BalanceThreshold       float64
+	RechargeMultiplier     *float64
+	RechargeMultiplierMode string
+	MonitorEnabled         bool
 	OnlyCreatedKeyGroupsEnabled bool
 }
 
@@ -190,23 +190,23 @@ func (s *Service) Create(in CreateInput) (*storage.Channel, error) {
 		return nil, fmt.Errorf("encrypt credential: %w", err)
 	}
 	c := &storage.Channel{
-		Name:                        in.Name,
-		Type:                        in.Type,
-		SiteURL:                     in.SiteURL,
-		Username:                    in.Username,
-		SortOrder:                   normalizeSortOrder(in.SortOrder),
-		PasswordCipher:              enc,
-		CredentialMode:              mode,
-		LoginExtraParams:            loginExtraParams,
-		TurnstileEnabled:            in.TurnstileEnabled && mode == storage.CredentialModePassword, // token 模式不需要打码
-		IgnoreAnnouncements:         in.IgnoreAnnouncements,
-		SubscriptionEnabled:         in.SubscriptionEnabled,
-		ProxyEnabled:                in.ProxyEnabled,
-		CaptchaConfigID:             in.CaptchaConfigID,
-		BalanceThreshold:            in.BalanceThreshold,
-		RechargeMultiplier:          normalizeRechargeMultiplier(in.RechargeMultiplier),
-		RechargeMultiplierMode:      connector.NormalizeRechargeMultiplierMode(in.RechargeMultiplierMode),
-		MonitorEnabled:              in.MonitorEnabled,
+		Name:                   in.Name,
+		Type:                   in.Type,
+		SiteURL:                in.SiteURL,
+		Username:               in.Username,
+		SortOrder:              normalizeSortOrder(in.SortOrder),
+		PasswordCipher:         enc,
+		CredentialMode:         mode,
+		LoginExtraParams:       loginExtraParams,
+		TurnstileEnabled:       in.TurnstileEnabled && mode == storage.CredentialModePassword, // token 模式不需要打码
+		IgnoreAnnouncements:    in.IgnoreAnnouncements,
+		SubscriptionEnabled:    in.SubscriptionEnabled,
+		ProxyEnabled:           in.ProxyEnabled,
+		CaptchaConfigID:        in.CaptchaConfigID,
+		BalanceThreshold:       in.BalanceThreshold,
+		RechargeMultiplier:     normalizeRechargeMultiplier(in.RechargeMultiplier),
+		RechargeMultiplierMode: connector.NormalizeRechargeMultiplierMode(in.RechargeMultiplierMode),
+		MonitorEnabled:         in.MonitorEnabled,
 		OnlyCreatedKeyGroupsEnabled: in.OnlyCreatedKeyGroupsEnabled,
 	}
 	if mode == storage.CredentialModeToken {
@@ -221,23 +221,23 @@ func (s *Service) Create(in CreateInput) (*storage.Channel, error) {
 
 // UpdateInput 编辑渠道的可选字段。Password / TokenCredential 为空表示不修改凭据。
 type UpdateInput struct {
-	Name                        *string
-	SiteURL                     *string
-	Username                    *string
-	SortOrder                   *int
-	Password                    *string
-	CredentialMode              *storage.CredentialMode
-	TokenCredential             *string // JSON
-	LoginExtraParams            *string
-	TurnstileEnabled            *bool
-	IgnoreAnnouncements         *bool
-	SubscriptionEnabled         *bool
-	ProxyEnabled                *bool
-	CaptchaConfigID             *uint
-	BalanceThreshold            *float64
-	RechargeMultiplier          *float64
-	RechargeMultiplierMode      *string
-	MonitorEnabled              *bool
+	Name                   *string
+	SiteURL                *string
+	Username               *string
+	SortOrder              *int
+	Password               *string
+	CredentialMode         *storage.CredentialMode
+	TokenCredential        *string // JSON
+	LoginExtraParams       *string
+	TurnstileEnabled       *bool
+	IgnoreAnnouncements    *bool
+	SubscriptionEnabled    *bool
+	ProxyEnabled           *bool
+	CaptchaConfigID        *uint
+	BalanceThreshold       *float64
+	RechargeMultiplier     *float64
+	RechargeMultiplierMode *string
+	MonitorEnabled         *bool
 	OnlyCreatedKeyGroupsEnabled *bool
 }
 
