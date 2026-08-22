@@ -192,13 +192,17 @@ func (c *Client) CheckAuth(ctx context.Context, ch *connector.Channel, session *
 // 让 channel/service.go 退回到重新登录路径（见 sub2api 同样的 SessionRefresher 实现）。
 func (c *Client) RefreshSession(ctx context.Context, ch *connector.Channel, session *connector.AuthSession) (*connector.AuthSession, error) {
 	if session == nil || strings.TrimSpace(session.RefreshToken) == "" {
-		return nil, errors.New("newapi refresh: missing refresh token")
+		return nil, connector.WrapSessionRefreshError(errors.New("newapi refresh: missing refresh token"), false)
 	}
-	site := strings.TrimRight(ch.SiteURL, "/")
+	site, origin, err := refreshSite(ch.SiteURL)
+	if err != nil {
+		return nil, connector.WrapSessionRefreshError(err, false)
+	}
 	req := c.http.R().
 		SetContext(ctx).
 		SetHeader("Content-Type", "application/json").
 		SetHeader("Accept", "application/json").
+		SetHeader("Origin", origin).
 		SetHeader("Cookie", newAPIRefreshCookieName+"="+strings.TrimSpace(session.RefreshToken))
 	if strings.TrimSpace(session.UserID) != "" {
 		// 与业务鉴权头一致的行为：New-Api-User 不会在新版 middleware 里被读取，
@@ -208,18 +212,19 @@ func (c *Client) RefreshSession(ctx context.Context, ch *connector.Channel, sess
 
 	resp, err := req.Post(site + "/api/user/auth/refresh")
 	if err != nil {
-		return nil, fmt.Errorf("newapi refresh http: %w", err)
+		return nil, connector.WrapSessionRefreshError(fmt.Errorf("newapi refresh http: %w", err), false)
 	}
 	if resp.IsError() {
-		return nil, fmt.Errorf("newapi refresh: %w", connector.HTTPStatusError(resp.StatusCode(), resp.Body()))
+		allowFallback := resp.StatusCode() == http.StatusUnauthorized
+		return nil, connector.WrapSessionRefreshError(fmt.Errorf("newapi refresh: %w", connector.HTTPStatusError(resp.StatusCode(), resp.Body())), allowFallback)
 	}
 
 	var wrapped newapiResp
 	if err := json.Unmarshal(resp.Body(), &wrapped); err != nil {
-		return nil, fmt.Errorf("newapi refresh decode: %w", err)
+		return nil, connector.WrapSessionRefreshError(fmt.Errorf("newapi refresh decode: %w", err), false)
 	}
 	if !wrapped.Success {
-		return nil, fmt.Errorf("newapi refresh: %s", wrapped.Message)
+		return nil, connector.WrapSessionRefreshError(fmt.Errorf("newapi refresh: %s", wrapped.Message), false)
 	}
 
 	var data struct {
@@ -230,10 +235,10 @@ func (c *Client) RefreshSession(ctx context.Context, ch *connector.Channel, sess
 		} `json:"user"`
 	}
 	if err := json.Unmarshal(wrapped.Data, &data); err != nil {
-		return nil, fmt.Errorf("newapi refresh data decode: %w", err)
+		return nil, connector.WrapSessionRefreshError(fmt.Errorf("newapi refresh data decode: %w", err), false)
 	}
 	if strings.TrimSpace(data.AccessToken) == "" || data.User.ID == 0 {
-		return nil, errors.New("newapi refresh: missing access_token or user id in response")
+		return nil, connector.WrapSessionRefreshError(errors.New("newapi refresh: missing access_token or user id in response"), false)
 	}
 
 	expires := time.Now().Add(14 * time.Minute)
@@ -252,6 +257,14 @@ func (c *Client) RefreshSession(ctx context.Context, ch *connector.Channel, sess
 	// Cookie 仅老版本鉴权路径使用；refresh 不维护它，清空以免误用旧 cookie。
 	refreshed.Cookie = ""
 	return &refreshed, nil
+}
+
+func refreshSite(raw string) (string, string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", "", fmt.Errorf("invalid NewAPI site URL: %q", raw)
+	}
+	return strings.TrimRight(u.String(), "/"), u.Scheme + "://" + u.Host, nil
 }
 
 // newAPIHasAuth 判断 session 是否带有 NewAPI 通过鉴权所必需的凭据。
