@@ -183,6 +183,7 @@ func (c *Client) CheckAuth(ctx context.Context, ch *connector.Channel, session *
 //
 // 调用上游 `POST /api/user/auth/refresh`（controller/auth_session.go RefreshAuth）：
 //   - 请求体为空，刷新令牌通过 Cookie: new_api_refresh=<RefreshToken> 提交；
+//     Origin 由 channel.SiteURL 推导，用于新版 NewAPI 的同源 Cookie 校验；
 //     可选 X-Auth-Session 头携带 SID 做越权校验，我们没有显式跟踪 SID 故不发送，
 //     由服务器按 cookie 自身记录的 SID 校验。
 //   - 成功响应 shape 与 Login 一致：data.{access_token, token_type, access_expires_at, user.id, session}；

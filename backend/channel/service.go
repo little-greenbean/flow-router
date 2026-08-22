@@ -35,10 +35,10 @@ type Service struct {
 	MonitorLogs  *storage.MonitorLogs
 	Cipher       *crypto.Cipher
 
-	mu           sync.RWMutex
-	proxyConfig  config.ProxyConfig
-	upstream     config.UpstreamConfig
-	sessionLocks sync.Map
+	mu          sync.RWMutex
+	proxyConfig config.ProxyConfig
+	upstream    config.UpstreamConfig
+	locks       sync.Map
 
 	// apiKeyGroupSetCache 缓存"已创建密钥的分组集合"。
 	// 该集合需要分页拉取上游全部密钥计算，monitor 每次刷新和前端切页都会用到，
@@ -702,7 +702,7 @@ func (s *Service) EnsureSession(
 }
 
 func (s *Service) sessionLock(channelID uint) *sync.Mutex {
-	lock, _ := s.sessionLocks.LoadOrStore(channelID, &sync.Mutex{})
+	lock, _ := s.locks.LoadOrStore(channelID, &sync.Mutex{})
 	return lock.(*sync.Mutex)
 }
 
