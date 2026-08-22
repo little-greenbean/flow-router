@@ -35,9 +35,10 @@ type Service struct {
 	MonitorLogs  *storage.MonitorLogs
 	Cipher       *crypto.Cipher
 
-	mu          sync.RWMutex
-	proxyConfig config.ProxyConfig
-	upstream    config.UpstreamConfig
+	mu           sync.RWMutex
+	proxyConfig  config.ProxyConfig
+	upstream     config.UpstreamConfig
+	sessionLocks sync.Map
 
 	// apiKeyGroupSetCache 缓存"已创建密钥的分组集合"。
 	// 该集合需要分页拉取上游全部密钥计算，monitor 每次刷新和前端切页都会用到，
@@ -146,24 +147,24 @@ type Sub2APITokenCredential struct {
 //   - password: Password 必填；Username 为登录账号
 //   - token:    TokenCredential 必填（已序列化为 JSON 字符串）；Username 仅作展示备注
 type CreateInput struct {
-	Name                   string
-	Type                   storage.ChannelType
-	SiteURL                string
-	Username               string
-	SortOrder              int
-	Password               string
-	CredentialMode         storage.CredentialMode
-	TokenCredential        string // JSON：password 模式时为空
-	LoginExtraParams       string
-	TurnstileEnabled       bool
-	IgnoreAnnouncements    bool
-	SubscriptionEnabled    bool
-	ProxyEnabled           bool
-	CaptchaConfigID        *uint
-	BalanceThreshold       float64
-	RechargeMultiplier     *float64
-	RechargeMultiplierMode string
-	MonitorEnabled         bool
+	Name                        string
+	Type                        storage.ChannelType
+	SiteURL                     string
+	Username                    string
+	SortOrder                   int
+	Password                    string
+	CredentialMode              storage.CredentialMode
+	TokenCredential             string // JSON：password 模式时为空
+	LoginExtraParams            string
+	TurnstileEnabled            bool
+	IgnoreAnnouncements         bool
+	SubscriptionEnabled         bool
+	ProxyEnabled                bool
+	CaptchaConfigID             *uint
+	BalanceThreshold            float64
+	RechargeMultiplier          *float64
+	RechargeMultiplierMode      string
+	MonitorEnabled              bool
 	OnlyCreatedKeyGroupsEnabled bool
 }
 
@@ -189,23 +190,23 @@ func (s *Service) Create(in CreateInput) (*storage.Channel, error) {
 		return nil, fmt.Errorf("encrypt credential: %w", err)
 	}
 	c := &storage.Channel{
-		Name:                   in.Name,
-		Type:                   in.Type,
-		SiteURL:                in.SiteURL,
-		Username:               in.Username,
-		SortOrder:              normalizeSortOrder(in.SortOrder),
-		PasswordCipher:         enc,
-		CredentialMode:         mode,
-		LoginExtraParams:       loginExtraParams,
-		TurnstileEnabled:       in.TurnstileEnabled && mode == storage.CredentialModePassword, // token 模式不需要打码
-		IgnoreAnnouncements:    in.IgnoreAnnouncements,
-		SubscriptionEnabled:    in.SubscriptionEnabled,
-		ProxyEnabled:           in.ProxyEnabled,
-		CaptchaConfigID:        in.CaptchaConfigID,
-		BalanceThreshold:       in.BalanceThreshold,
-		RechargeMultiplier:     normalizeRechargeMultiplier(in.RechargeMultiplier),
-		RechargeMultiplierMode: connector.NormalizeRechargeMultiplierMode(in.RechargeMultiplierMode),
-		MonitorEnabled:         in.MonitorEnabled,
+		Name:                        in.Name,
+		Type:                        in.Type,
+		SiteURL:                     in.SiteURL,
+		Username:                    in.Username,
+		SortOrder:                   normalizeSortOrder(in.SortOrder),
+		PasswordCipher:              enc,
+		CredentialMode:              mode,
+		LoginExtraParams:            loginExtraParams,
+		TurnstileEnabled:            in.TurnstileEnabled && mode == storage.CredentialModePassword, // token 模式不需要打码
+		IgnoreAnnouncements:         in.IgnoreAnnouncements,
+		SubscriptionEnabled:         in.SubscriptionEnabled,
+		ProxyEnabled:                in.ProxyEnabled,
+		CaptchaConfigID:             in.CaptchaConfigID,
+		BalanceThreshold:            in.BalanceThreshold,
+		RechargeMultiplier:          normalizeRechargeMultiplier(in.RechargeMultiplier),
+		RechargeMultiplierMode:      connector.NormalizeRechargeMultiplierMode(in.RechargeMultiplierMode),
+		MonitorEnabled:              in.MonitorEnabled,
 		OnlyCreatedKeyGroupsEnabled: in.OnlyCreatedKeyGroupsEnabled,
 	}
 	if mode == storage.CredentialModeToken {
@@ -220,23 +221,23 @@ func (s *Service) Create(in CreateInput) (*storage.Channel, error) {
 
 // UpdateInput 编辑渠道的可选字段。Password / TokenCredential 为空表示不修改凭据。
 type UpdateInput struct {
-	Name                   *string
-	SiteURL                *string
-	Username               *string
-	SortOrder              *int
-	Password               *string
-	CredentialMode         *storage.CredentialMode
-	TokenCredential        *string // JSON
-	LoginExtraParams       *string
-	TurnstileEnabled       *bool
-	IgnoreAnnouncements    *bool
-	SubscriptionEnabled    *bool
-	ProxyEnabled           *bool
-	CaptchaConfigID        *uint
-	BalanceThreshold       *float64
-	RechargeMultiplier     *float64
-	RechargeMultiplierMode *string
-	MonitorEnabled         *bool
+	Name                        *string
+	SiteURL                     *string
+	Username                    *string
+	SortOrder                   *int
+	Password                    *string
+	CredentialMode              *storage.CredentialMode
+	TokenCredential             *string // JSON
+	LoginExtraParams            *string
+	TurnstileEnabled            *bool
+	IgnoreAnnouncements         *bool
+	SubscriptionEnabled         *bool
+	ProxyEnabled                *bool
+	CaptchaConfigID             *uint
+	BalanceThreshold            *float64
+	RechargeMultiplier          *float64
+	RechargeMultiplierMode      *string
+	MonitorEnabled              *bool
 	OnlyCreatedKeyGroupsEnabled *bool
 }
 
@@ -642,6 +643,10 @@ func (s *Service) EnsureSession(
 	resolved *connector.Channel,
 	conn connector.Connector,
 ) (*connector.AuthSession, error) {
+	lock := s.sessionLock(c.ID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	if c.CredentialMode == storage.CredentialModeToken {
 		progress.Start(ctx, progress.StageSession, "使用用户提供的 token…")
 		session, err := s.buildSessionFromToken(c)
@@ -696,6 +701,11 @@ func (s *Service) EnsureSession(
 	return s.login(ctx, c, resolved, conn)
 }
 
+func (s *Service) sessionLock(channelID uint) *sync.Mutex {
+	lock, _ := s.sessionLocks.LoadOrStore(channelID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
 func (s *Service) refreshStoredSession(
 	ctx context.Context,
 	c *storage.Channel,
@@ -709,6 +719,11 @@ func (s *Service) refreshStoredSession(
 	progress.Start(ctx, progress.StageSession, "使用 refresh_token 刷新会话…")
 	refreshed, err := refreshSession(ctx, resolved, conn, session)
 	if err != nil {
+		if !connector.ShouldLoginAfterRefreshError(err) {
+			progress.Fail(ctx, progress.StageSession, err.Error())
+			_ = s.Channels.SetLastError(c.ID, err.Error())
+			return nil, false, err
+		}
 		progress.OK(ctx, progress.StageSession, "刷新失败，重新登录")
 		return nil, false, nil
 	}

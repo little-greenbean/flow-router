@@ -139,7 +139,7 @@ func TestLoginNewAPIMissingUserFails(t *testing.T) {
 // 成功响应返回新的 access_token，并通过 Set-Cookie 轮换 refresh token。
 func TestRefreshSessionPostsRefreshCookie(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/user/auth/refresh", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/newapi/api/user/auth/refresh", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("method = %s, want POST", r.Method)
 		}
@@ -167,7 +167,7 @@ func TestRefreshSessionPostsRefreshCookie(t *testing.T) {
 		RefreshToken: "old-refresh",
 		ExpiresAt:    time.Now().Add(1 * time.Minute),
 	}
-	refreshed, err := c.RefreshSession(context.Background(), &connector.Channel{SiteURL: srv.URL}, old)
+	refreshed, err := c.RefreshSession(context.Background(), &connector.Channel{SiteURL: srv.URL + "/newapi/"}, old)
 	if err != nil {
 		t.Fatalf("RefreshSession: %v", err)
 	}
