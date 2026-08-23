@@ -12,6 +12,7 @@ import type {
   CostTrendPoint,
   DashboardSummary,
   GatewayDispatchStats,
+  GatewayDispatchTrends,
   GatewayDispatchWindow,
   GatewayUsageStats,
   NotificationChannel,
@@ -152,6 +153,13 @@ export function useGatewayUsageStatsToday() {
 
 export function useGatewayDispatchStats(window: GatewayDispatchWindow) {
   return useApi<GatewayDispatchStats>(`/gateway/dispatch/stats?window=${window}`)
+}
+
+export function useGatewayDispatchTrends(from?: string, to?: string, bucket = "5m") {
+  const qs = new URLSearchParams({ bucket })
+  if (from) qs.set("from", from)
+  if (to) qs.set("to", to)
+  return useApi<GatewayDispatchTrends>(`/gateway/dispatch/trends?${qs}`)
 }
 
 export function useAppVersion() {

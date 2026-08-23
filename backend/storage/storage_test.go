@@ -1199,4 +1199,49 @@ func TestGatewayUsageDispatchStats(t *testing.T) {
 	}
 }
 
+func TestGatewayUsageDispatchTrendsAggregatesRequestChains(t *testing.T) {
+	db := openTestDB(t)
+	usage := NewGatewayUsageLogs(db)
+	if err := db.Create(&GatewayGroup{ID: 9, Name: "趋势网关"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+	to := from.Add(10 * time.Minute)
+	rows := []GatewayUsageLog{
+		{GatewayGroupID: 9, RouteID: 91, RequestID: "trend-1", Attempt: 1, AttemptKind: "primary", Success: false, FirstTokenMS: ptrInt64(900), CreatedAt: from.Add(30 * time.Second)},
+		{GatewayGroupID: 9, RouteID: 92, RequestID: "trend-1", Attempt: 2, AttemptKind: "failover", Success: true, FirstTokenMS: ptrInt64(500), CreatedAt: from.Add(31 * time.Second)},
+		{GatewayGroupID: 9, RouteID: 91, RequestID: "trend-2", Attempt: 1, AttemptKind: "primary", Success: true, FirstTokenMS: ptrInt64(700), CreatedAt: from.Add(2 * time.Minute)},
+		{GatewayGroupID: 9, RouteID: 92, RequestID: "trend-3", Attempt: 1, AttemptKind: "primary", Success: false, FirstTokenMS: ptrInt64(1100), CreatedAt: from.Add(6 * time.Minute)},
+	}
+	for i := range rows {
+		if err := usage.Create(&rows[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	trends, err := usage.DispatchTrends(from, to, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trends.Groups) != 1 || len(trends.Groups[0].Points) != 2 {
+		t.Fatalf("unexpected trend groups: %+v", trends.Groups)
+	}
+	first := trends.Groups[0].Points[0]
+	if first.Requests != 2 || first.FinalErrorRate != 0 || first.FailoverTriggerRate != .5 || first.FailoverRecoveryRate != 1 || first.TTFTP50 != 700 || first.TTFTP95 != 900 {
+		t.Fatalf("unexpected first point: %+v", first)
+	}
+	if first.RPM != .4 {
+		t.Fatalf("unexpected rpm: %v", first.RPM)
+	}
+	var route91 *GatewayDispatchTrendRoute
+	for i := range trends.Groups[0].Routes {
+		if trends.Groups[0].Routes[i].RouteID == 91 {
+			route91 = &trends.Groups[0].Routes[i]
+			break
+		}
+	}
+	if route91 == nil || len(route91.Points) != 1 || route91.Points[0].FinalErrorRate != .5 {
+		t.Fatalf("route attempts were not isolated: %+v", route91)
+	}
+}
+
 func ptrInt64(v int64) *int64 { return &v }

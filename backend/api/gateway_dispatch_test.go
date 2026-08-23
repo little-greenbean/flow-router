@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -57,6 +58,35 @@ func TestGatewayDispatchStats(t *testing.T) {
 		t.Fatalf("invalid window status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestGatewayDispatchTrends(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := openTestDB(t)
+	usage := storage.NewGatewayUsageLogs(db)
+	now := time.Now().UTC()
+	for i := 0; i < 2; i++ {
+		if err := usage.Create(&storage.GatewayUsageLog{GatewayGroupID: 1, RouteID: 2, RequestID: "trend-api-" + strconv.Itoa(i), Attempt: 1, Success: true, FirstTokenMS: storageInt64Ptr(400 + int64(i*100)), CreatedAt: now.Add(-time.Duration(i+1) * time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := gin.New()
+	r.GET("/api/gateway/dispatch/trends", func(c *gin.Context) { trendsGatewayDispatch(c, &Deps{GatewayUsage: usage}) })
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/dispatch/trends?bucket=1m", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var got storage.GatewayDispatchTrends
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Bucket != "1m" || len(got.Groups) != 1 || len(got.Groups[0].Points) == 0 {
+		t.Fatalf("unexpected trend response: %+v", got)
+	}
+}
+
+func storageInt64Ptr(value int64) *int64 { return &value }
 
 func TestGatewayDispatchStatsUsesSourceNamesAndCostOrder(t *testing.T) {
 	gin.SetMode(gin.TestMode)

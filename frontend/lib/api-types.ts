@@ -916,6 +916,44 @@ export interface GatewayDispatchStats {
   groups: GatewayDispatchStatsGroup[]
 }
 
+export type DispatchTrendMetric = "ttft" | "quality" | "throughput"
+export type DispatchTrendAggregation = "p50" | "p90" | "p95" | "avg" | "max" | "final_error" | "failover_trigger" | "failover_recovery" | "rpm" | "requests"
+
+export interface GatewayDispatchTrendPoint {
+  timestamp: string
+  ttft_p50: number
+  ttft_p90: number
+  ttft_p95: number
+  ttft_avg: number
+  ttft_max: number
+  final_error_rate: number
+  failover_trigger_rate: number
+  failover_recovery_rate: number
+  requests: number
+  rpm: number
+}
+
+export interface GatewayDispatchTrendRoute {
+  route_id: number
+  route_name: string
+  provider_name?: string
+  points: GatewayDispatchTrendPoint[]
+}
+
+export interface GatewayDispatchTrendGroup {
+  gateway_group_id: number
+  gateway_group_name: string
+  points: GatewayDispatchTrendPoint[]
+  routes: GatewayDispatchTrendRoute[]
+}
+
+export interface GatewayDispatchTrends {
+  from: string
+  to: string
+  bucket: string
+  groups: GatewayDispatchTrendGroup[]
+}
+
 /** 使用记录模型下拉：后端按 requested_model 聚合 */
 export interface GatewayUsageModelOption {
   model: string

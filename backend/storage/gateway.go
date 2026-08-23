@@ -3,6 +3,7 @@ package storage
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -601,6 +602,265 @@ type GatewayDispatchStatsRoute struct {
 	FailureRate           float64  `json:"failure_rate"`
 	FirstTokenSamples     int64    `json:"first_token_samples"`
 	AverageFirstTokenMS   *float64 `json:"average_first_token_ms"`
+}
+
+type GatewayDispatchTrendPoint struct {
+	Timestamp            time.Time `json:"timestamp"`
+	TTFTP50              float64   `json:"ttft_p50"`
+	TTFTP90              float64   `json:"ttft_p90"`
+	TTFTP95              float64   `json:"ttft_p95"`
+	TTFTAvg              float64   `json:"ttft_avg"`
+	TTFTMax              float64   `json:"ttft_max"`
+	FinalErrorRate       float64   `json:"final_error_rate"`
+	FailoverTriggerRate  float64   `json:"failover_trigger_rate"`
+	FailoverRecoveryRate float64   `json:"failover_recovery_rate"`
+	Requests             int64     `json:"requests"`
+	RPM                  float64   `json:"rpm"`
+}
+
+type GatewayDispatchTrendRoute struct {
+	RouteID      uint                        `json:"route_id"`
+	RouteName    string                      `json:"route_name"`
+	ProviderName string                      `json:"provider_name,omitempty"`
+	Points       []GatewayDispatchTrendPoint `json:"points"`
+}
+
+type GatewayDispatchTrendGroup struct {
+	GatewayGroupID   uint                        `json:"gateway_group_id"`
+	GatewayGroupName string                      `json:"gateway_group_name"`
+	Points           []GatewayDispatchTrendPoint `json:"points"`
+	Routes           []GatewayDispatchTrendRoute `json:"routes"`
+}
+
+type GatewayDispatchTrends struct {
+	From   time.Time                   `json:"from"`
+	To     time.Time                   `json:"to"`
+	Bucket string                      `json:"bucket"`
+	Groups []GatewayDispatchTrendGroup `json:"groups"`
+}
+
+func dispatchTrendBucketLabel(bucket time.Duration) string {
+	switch bucket {
+	case time.Minute:
+		return "1m"
+	case 3 * time.Minute:
+		return "3m"
+	case 5 * time.Minute:
+		return "5m"
+	case 10 * time.Minute:
+		return "10m"
+	case 30 * time.Minute:
+		return "30m"
+	default:
+		return bucket.String()
+	}
+}
+
+// DispatchTrends aggregates request chains into fixed time buckets. The raw
+// attempts are grouped in Go so the same logic works for SQLite and MySQL.
+func (r *GatewayUsageLogs) DispatchTrends(from, to time.Time, bucket time.Duration) (GatewayDispatchTrends, error) {
+	if from.IsZero() || to.IsZero() || !to.After(from) || bucket <= 0 {
+		return GatewayDispatchTrends{}, fmt.Errorf("invalid dispatch trend range")
+	}
+	var logs []GatewayUsageLog
+	query := r.db.Where("created_at >= ? AND created_at < ?", from, to)
+	if isSQLite(r.db) {
+		query = r.db.Where("CAST(strftime('%s', created_at) AS INTEGER) >= ? AND CAST(strftime('%s', created_at) AS INTEGER) < ?", from.Unix(), to.Unix())
+	}
+	if err := query.Order("created_at ASC, id ASC").Find(&logs).Error; err != nil {
+		return GatewayDispatchTrends{}, err
+	}
+	result := GatewayDispatchTrends{From: from, To: to, Bucket: dispatchTrendBucketLabel(bucket), Groups: []GatewayDispatchTrendGroup{}}
+	if len(logs) == 0 {
+		return result, nil
+	}
+	type chain struct{ logs []GatewayUsageLog }
+	chains := make(map[string]*chain)
+	groupNames := make(map[uint]string)
+	for _, log := range logs {
+		key := fmt.Sprintf("%d:%s", log.GatewayGroupID, log.RequestID)
+		if chains[key] == nil {
+			chains[key] = &chain{}
+		}
+		chains[key].logs = append(chains[key].logs, log)
+		if _, ok := groupNames[log.GatewayGroupID]; !ok {
+			groupNames[log.GatewayGroupID] = fmt.Sprintf("组 #%d", log.GatewayGroupID)
+		}
+	}
+	var dbGroups []GatewayGroup
+	if err := r.db.Where("id IN ?", keysUint(groupNames)).Find(&dbGroups).Error; err == nil {
+		for _, group := range dbGroups {
+			groupNames[group.ID] = group.Name
+		}
+	}
+	type bucketData struct {
+		values []float64
+		chains map[string]*chain
+	}
+	groupBuckets := make(map[uint]map[time.Time]*bucketData)
+	routeBuckets := make(map[uint]map[uint]map[time.Time]*bucketData)
+	for key, current := range chains {
+		_ = key
+		if len(current.logs) == 0 {
+			continue
+		}
+		first := current.logs[0]
+		bucketStart := from.Add(time.Duration(first.CreatedAt.Sub(from)/bucket) * bucket)
+		if bucketStart.Before(from) {
+			bucketStart = from
+		}
+		groupMap := groupBuckets[first.GatewayGroupID]
+		if groupMap == nil {
+			groupMap = map[time.Time]*bucketData{}
+			groupBuckets[first.GatewayGroupID] = groupMap
+		}
+		data := groupMap[bucketStart]
+		if data == nil {
+			data = &bucketData{chains: map[string]*chain{}}
+			groupMap[bucketStart] = data
+		}
+		data.chains[key] = current
+		routeMap := routeBuckets[first.GatewayGroupID]
+		if routeMap == nil {
+			routeMap = map[uint]map[time.Time]*bucketData{}
+			routeBuckets[first.GatewayGroupID] = routeMap
+		}
+		for _, attempt := range current.logs {
+			routeDataMap := routeMap[attempt.RouteID]
+			if routeDataMap == nil {
+				routeDataMap = map[time.Time]*bucketData{}
+				routeMap[attempt.RouteID] = routeDataMap
+			}
+			routeData := routeDataMap[bucketStart]
+			if routeData == nil {
+				routeData = &bucketData{chains: map[string]*chain{}}
+				routeDataMap[bucketStart] = routeData
+			}
+			routeData.chains[key] = current
+		}
+	}
+	buildPoint := func(data *bucketData, start time.Time, routeID uint) GatewayDispatchTrendPoint {
+		point := GatewayDispatchTrendPoint{Timestamp: start, RPM: 0}
+		values := make([]float64, 0)
+		for _, current := range data.chains {
+			logs := current.logs
+			if routeID != 0 {
+				logs = make([]GatewayUsageLog, 0, len(current.logs))
+				for _, attempt := range current.logs {
+					if attempt.RouteID == routeID {
+						logs = append(logs, attempt)
+					}
+				}
+				if len(logs) == 0 {
+					continue
+				}
+			}
+			point.Requests++
+			final := logs[len(logs)-1]
+			if !final.Success {
+				point.FinalErrorRate++
+			}
+			triggered := false
+			for _, attempt := range logs {
+				if attempt.Attempt > 1 || attempt.AttemptKind == "retry" || attempt.AttemptKind == "failover" {
+					triggered = true
+				}
+				if attempt.FirstTokenMS != nil {
+					values = append(values, float64(*attempt.FirstTokenMS))
+				}
+			}
+			if triggered {
+				point.FailoverTriggerRate++
+				if final.Success {
+					point.FailoverRecoveryRate++
+				}
+			}
+		}
+		if point.Requests > 0 {
+			point.FinalErrorRate /= float64(point.Requests)
+			point.FailoverTriggerRate /= float64(point.Requests)
+		}
+		triggeredCount := point.FailoverTriggerRate * float64(point.Requests)
+		if triggeredCount > 0 {
+			point.FailoverRecoveryRate /= triggeredCount
+		} else {
+			point.FailoverRecoveryRate = 0
+		}
+		if len(values) > 0 {
+			sort.Float64s(values)
+			point.TTFTAvg = averageFloat(values)
+			point.TTFTP50 = percentileFloat(values, .50)
+			point.TTFTP90 = percentileFloat(values, .90)
+			point.TTFTP95 = percentileFloat(values, .95)
+			point.TTFTMax = values[len(values)-1]
+		}
+		point.RPM = float64(point.Requests) / bucket.Minutes()
+		return point
+	}
+	for groupID, bucketMap := range groupBuckets {
+		group := GatewayDispatchTrendGroup{GatewayGroupID: groupID, GatewayGroupName: groupNames[groupID], Points: make([]GatewayDispatchTrendPoint, 0), Routes: make([]GatewayDispatchTrendRoute, 0)}
+		for start := from; start.Before(to); start = start.Add(bucket) {
+			if data := bucketMap[start]; data != nil {
+				group.Points = append(group.Points, buildPoint(data, start, 0))
+			}
+		}
+		for routeID, routeMap := range routeBuckets[groupID] {
+			route := GatewayDispatchTrendRoute{RouteID: routeID, RouteName: fmt.Sprintf("路由 #%d", routeID), Points: make([]GatewayDispatchTrendPoint, 0)}
+			for _, bucketData := range routeMap {
+				for _, current := range bucketData.chains {
+					for _, log := range current.logs {
+						if log.RouteID == routeID {
+							if log.SourceAPIKeyName != "" {
+								route.RouteName = log.SourceAPIKeyName
+							}
+							if route.ProviderName == "" {
+								route.ProviderName = log.ProviderName
+							}
+							break
+						}
+					}
+				}
+			}
+			for start := from; start.Before(to); start = start.Add(bucket) {
+				if data := routeMap[start]; data != nil {
+					route.Points = append(route.Points, buildPoint(data, start, routeID))
+				}
+			}
+			group.Routes = append(group.Routes, route)
+		}
+		sort.Slice(group.Routes, func(i, j int) bool { return group.Routes[i].RouteID < group.Routes[j].RouteID })
+		result.Groups = append(result.Groups, group)
+	}
+	sort.Slice(result.Groups, func(i, j int) bool { return result.Groups[i].GatewayGroupID < result.Groups[j].GatewayGroupID })
+	return result, nil
+}
+
+func averageFloat(values []float64) float64 {
+	var total float64
+	for _, value := range values {
+		total += value
+	}
+	return total / float64(len(values))
+}
+func percentileFloat(values []float64, percentile float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	index := int(math.Ceil(percentile*float64(len(values)))) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(values) {
+		index = len(values) - 1
+	}
+	return values[index]
+}
+func keysUint(values map[uint]string) []uint {
+	keys := make([]uint, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 // DispatchStats 按网关组和路由聚合窗口内的每次调度尝试。

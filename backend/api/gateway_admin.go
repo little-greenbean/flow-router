@@ -63,6 +63,7 @@ func registerGatewayAdmin(g *gin.RouterGroup, d *Deps) {
 
 		// usage
 		gp.GET("/dispatch/stats", func(c *gin.Context) { statsGatewayDispatch(c, d) })
+		gp.GET("/dispatch/trends", func(c *gin.Context) { trendsGatewayDispatch(c, d) })
 		gp.GET("/usage", func(c *gin.Context) { listGatewayUsage(c, d) })
 		gp.GET("/usage/stats", func(c *gin.Context) { statsGatewayUsage(c, d) })
 		gp.GET("/usage/models", func(c *gin.Context) { listGatewayUsageModels(c, d) })
@@ -119,6 +120,51 @@ func statsGatewayDispatch(c *gin.Context, d *Deps) {
 		"to":     to.Format(time.RFC3339Nano),
 		"groups": groups,
 	})
+}
+
+var dispatchTrendBuckets = map[string]time.Duration{
+	"1m": time.Minute, "3m": 3 * time.Minute, "5m": 5 * time.Minute,
+	"10m": 10 * time.Minute, "30m": 30 * time.Minute,
+}
+
+func trendsGatewayDispatch(c *gin.Context, d *Deps) {
+	if d.GatewayUsage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage storage unavailable"})
+		return
+	}
+	to := time.Now().UTC()
+	from := to.Add(-6 * time.Hour)
+	if raw := strings.TrimSpace(c.Query("from")); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid from"})
+			return
+		}
+		from = parsed
+	}
+	if raw := strings.TrimSpace(c.Query("to")); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid to"})
+			return
+		}
+		to = parsed
+	}
+	bucketRaw := strings.ToLower(strings.TrimSpace(c.Query("bucket")))
+	if bucketRaw == "" {
+		bucketRaw = "5m"
+	}
+	bucket, ok := dispatchTrendBuckets[bucketRaw]
+	if !ok || !to.After(from) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid trend range or bucket"})
+		return
+	}
+	trends, err := d.GatewayUsage.DispatchTrends(from, to, bucket)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, trends)
 }
 
 func listGatewayProviders(c *gin.Context, d *Deps) {

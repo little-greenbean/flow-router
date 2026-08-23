@@ -1,221 +1,158 @@
 "use client"
 
-import { useMemo, useState } from "react"
-import { Activity, Route, Timer } from "lucide-react"
-import { useNavigate } from "react-router-dom"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { Activity } from "lucide-react"
+import * as echarts from "echarts"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { useGatewayDispatchStats } from "@/lib/queries"
-import type { GatewayDispatchWindow } from "@/lib/api-types"
+import { useGatewayDispatchTrends } from "@/lib/queries"
+import type { DispatchTrendAggregation, DispatchTrendMetric, GatewayDispatchTrendPoint } from "@/lib/api-types"
 import { cn } from "@/lib/utils"
-import {
-  DISPATCH_WINDOW_OPTIONS,
-  chunkDispatchGroups,
-  failureRateTone,
-  formatDispatchRouteMetric,
-  formatDispatchRouteSource,
-  formatDispatchRouteGroup,
-  formatBillingRate,
-  dispatchRoutePath,
-  formatFailureRate,
-  formatFirstToken,
-  metricBarPercent,
-  isDispatchRouteNavigable,
-} from "@/components/monitor/dispatch-health-utils"
 
-const failureTextClass = {
-  success: "text-success",
-  warning: "text-warning",
-  danger: "text-danger",
+type ZoomMode = "slider" | "follow"
+type DataZoomRange = { start?: number; end?: number; startValue?: number; endValue?: number }
+type DataZoomEventParams = DataZoomRange & { batch?: DataZoomRange[] }
+
+const COLORS = ["#2878bd", "#db7b2b", "#3d9a6d", "#c45050", "#7b61b3", "#1e969b"]
+const METRICS: { value: DispatchTrendMetric; label: string; options: { value: DispatchTrendAggregation; label: string }[] }[] = [
+  { value: "ttft", label: "TTFT", options: [["p95", "P95"], ["p90", "P90"], ["p50", "P50"], ["avg", "AVG"], ["max", "Max"]].map(([value, label]) => ({ value: value as DispatchTrendAggregation, label })) },
+  { value: "quality", label: "调度质量", options: [["final_error", "最终错误率"], ["failover_trigger", "顺延触发率"], ["failover_recovery", "顺延恢复率"]].map(([value, label]) => ({ value: value as DispatchTrendAggregation, label })) },
+  { value: "throughput", label: "吞吐量", options: [["rpm", "RPM"], ["requests", "请求数"]].map(([value, label]) => ({ value: value as DispatchTrendAggregation, label })) },
+]
+
+function initialRange() {
+  const to = new Date()
+  return { from: new Date(to.getTime() - 6 * 60 * 60 * 1000).toISOString(), to: to.toISOString() }
 }
 
-const failureBarClass = {
-  success: "bg-success",
-  warning: "bg-warning",
-  danger: "bg-danger",
+function pointValue(point: GatewayDispatchTrendPoint, aggregation: DispatchTrendAggregation): number | null {
+  const values: Record<DispatchTrendAggregation, number> = {
+    p50: point.ttft_p50, p90: point.ttft_p90, p95: point.ttft_p95, avg: point.ttft_avg, max: point.ttft_max,
+    final_error: point.final_error_rate * 100, failover_trigger: point.failover_trigger_rate * 100,
+    failover_recovery: point.failover_recovery_rate * 100, rpm: point.rpm, requests: point.requests,
+  }
+  const value = values[aggregation]
+  return ["p50", "p90", "p95", "avg", "max"].includes(aggregation) ? (value > 0 ? value : null) : value
+}
+
+function metricUnit(metric: DispatchTrendMetric, aggregation: DispatchTrendAggregation) {
+  if (metric === "ttft") return "ms"
+  if (metric === "quality") return "%"
+  return aggregation === "rpm" ? "req/min" : "requests"
+}
+
+function chartOption(
+  names: string[],
+  points: Map<string, GatewayDispatchTrendPoint[]>,
+  metric: DispatchTrendMetric,
+  aggregation: DispatchTrendAggregation,
+  axisRange: { from: string; to: string },
+  visible: { from: string; to: string },
+  zoom: ZoomMode,
+  selectedName = "",
+) {
+  const series = names.map((name, index) => ({
+    id: name,
+    name, type: "line" as const, smooth: 0.38, smoothMonotone: "x" as const, connectNulls: true, showSymbol: false, triggerLineEvent: true,
+    data: (points.get(name) ?? []).map((point) => [point.timestamp, pointValue(point, aggregation)]),
+    lineStyle: { color: selectedName && selectedName !== name ? "#cbd2da" : COLORS[index % COLORS.length], width: selectedName === name ? 3.2 : 2.2, opacity: selectedName && selectedName !== name ? 0.42 : 1 },
+    itemStyle: { color: selectedName && selectedName !== name ? "#cbd2da" : COLORS[index % COLORS.length] },
+    emphasis: { focus: "series" as const, lineStyle: { width: 3.8, opacity: 1 } },
+    cursor: "pointer",
+  }))
+  return {
+    animationDuration: 180, animationDurationUpdate: 0,
+    grid: { left: 48, right: 18, top: 20, bottom: zoom === "slider" ? 56 : 30 },
+    tooltip: { trigger: "item", confine: true, valueFormatter: (value: number) => `${value} ${metricUnit(metric, aggregation)}` },
+    xAxis: { type: "time", min: Date.parse(zoom === "slider" ? axisRange.from : visible.from), max: Date.parse(zoom === "slider" ? axisRange.to : visible.to), boundaryGap: false, axisLabel: { color: "#707c8e", fontSize: 10 }, axisLine: { lineStyle: { color: "#ccd4de" } } },
+    yAxis: { type: "value", axisLabel: { color: "#707c8e", fontSize: 10 }, splitLine: { lineStyle: { color: "#edf0f4" } } },
+    ...(zoom === "slider" ? { dataZoom: [{ type: "inside", filterMode: "none", startValue: Date.parse(visible.from), endValue: Date.parse(visible.to) }, { type: "slider", filterMode: "none", height: 16, bottom: 3, startValue: Date.parse(visible.from), endValue: Date.parse(visible.to), showDetail: false, borderColor: "#d5dde6", fillerColor: "rgba(45,114,181,.14)", handleStyle: { color: "#2d72b5" } }] } : {}),
+    series,
+  }
+}
+
+function bucketMilliseconds(bucket: string): number {
+  const minutes = Number.parseInt(bucket, 10)
+  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 5) * 60_000
 }
 
 export function DispatchHealthPanel() {
-  const navigate = useNavigate()
-  const [window, setWindow] = useState<GatewayDispatchWindow>("5m")
-  const stats = useGatewayDispatchStats(window)
-  const groups = stats.data?.groups ?? []
-  const routeCount = useMemo(
-    () => groups.reduce((sum, group) => sum + group.routes.length, 0),
-    [groups],
-  )
+  const fullRange = useMemo(initialRange, [])
+  const [visibleRange, setVisibleRange] = useState(fullRange)
+  const [metric, setMetric] = useState<DispatchTrendMetric>("ttft")
+  const [aggregation, setAggregation] = useState<DispatchTrendAggregation>("p95")
+  const [selectedGatewayID, setSelectedGatewayID] = useState<number | null>(null)
+  const [selectedRouteID, setSelectedRouteID] = useState<number | null>(null)
+  const bucket = "5m"
+  const trends = useGatewayDispatchTrends(fullRange.from, fullRange.to, bucket)
+  const gatewayRef = useRef<HTMLDivElement>(null); const routeRef = useRef<HTMLDivElement>(null)
+  const gatewayChart = useRef<echarts.ECharts | null>(null); const routeChart = useRef<echarts.ECharts | null>(null)
+  const visibleRangeRef = useRef(visibleRange)
+  visibleRangeRef.current = visibleRange
+  const activeMetric = METRICS.find((item) => item.value === metric) ?? METRICS[0]
+  const groups = trends.data?.groups ?? []
+  const currentGateway = groups.find((group) => group.gateway_group_id === selectedGatewayID) ?? groups[0]
+  const routes = currentGateway?.routes ?? []
+  const selectedGatewayName = selectedGatewayID == null ? "" : currentGateway?.gateway_group_name ?? ""
+  const selectedRouteName = routes.find((route) => route.route_id === selectedRouteID)?.route_name ?? ""
 
-  return (
-    <Card className="overflow-hidden border border-border py-2 shadow-none sm:py-3">
-      <CardHeader className="gap-1.5 px-3 pb-1.5 sm:flex sm:flex-row sm:items-center sm:justify-between sm:px-4">
-        <div className="min-w-0">
-          <CardTitle className="flex items-center gap-1.5 text-sm font-semibold">
-            <Activity className="size-3.5 text-brand" />
-            调度情况
-          </CardTitle>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
-            {groups.length > 0
-              ? `${groups.length} 个网关组 · ${routeCount} 条统计路由`
-              : "按路由尝试统计失败率与平均首字时间"}
-          </p>
-        </div>
+  const bounds = useMemo(() => {
+    const timestamps = groups.flatMap((group) => group.points.map((point) => Date.parse(point.timestamp))).filter(Number.isFinite)
+    if (timestamps.length === 0) return fullRange
+    const step = bucketMilliseconds(bucket)
+    return { from: new Date(Math.min(...timestamps)).toISOString(), to: new Date(Math.max(...timestamps) + step).toISOString() }
+  }, [groups, fullRange, bucket])
 
-        <div className="max-w-full overflow-x-auto pb-1 sm:pb-0" aria-label="统计时间窗口">
-          <div className="inline-flex min-w-max items-center rounded-md border border-border bg-muted/30 p-0.5" role="radiogroup">
-            {DISPATCH_WINDOW_OPTIONS.map((option) => {
-              const active = option.value === window
-              return (
-                <button
-                  key={option.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  onClick={() => setWindow(option.value)}
-                  className={cn(
-                    "h-6 rounded px-2 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                    active
-                      ? "bg-background text-foreground shadow-sm ring-1 ring-border"
-                      : "text-muted-foreground hover:bg-background/60 hover:text-foreground",
-                  )}
-                >
-                  {option.label}
-                </button>
-              )
-            })}
-          </div>
-        </div>
-      </CardHeader>
+  useEffect(() => {
+    const from = Math.max(Date.parse(bounds.from), Math.min(Date.parse(visibleRange.from), Date.parse(bounds.to) - bucketMilliseconds(bucket)))
+    const to = Math.min(Date.parse(bounds.to), Math.max(Date.parse(visibleRange.to), from + bucketMilliseconds(bucket)))
+    if (from !== Date.parse(visibleRange.from) || to !== Date.parse(visibleRange.to)) setVisibleRange({ from: new Date(from).toISOString(), to: new Date(to).toISOString() })
+  }, [bounds, bucket, visibleRange.from, visibleRange.to])
+  useEffect(() => { const timer = window.setInterval(() => trends.refetch(), 60_000); return () => window.clearInterval(timer) }, [fullRange.from, fullRange.to])
+  useEffect(() => { if (!activeMetric.options.some((option) => option.value === aggregation)) setAggregation(activeMetric.options[0].value) }, [activeMetric, aggregation])
+  useEffect(() => { setSelectedRouteID(null) }, [currentGateway?.gateway_group_id])
 
-      <CardContent className="px-0 pb-0">
-        {stats.loading && !stats.data ? (
-          <div className="flex h-32 items-center justify-center text-xs text-muted-foreground">
-            正在加载调度数据...
-          </div>
-        ) : stats.error ? (
-          <div className="mx-4 rounded-md border border-danger/25 bg-danger/5 px-3 py-4 text-sm text-danger sm:mx-6">
-            调度数据加载失败：{stats.error}
-          </div>
-        ) : groups.length === 0 ? (
-          <div className="flex h-32 flex-col items-center justify-center gap-2 text-muted-foreground">
-            <Route className="size-5" />
-            <p className="text-sm">当前时间窗口暂无调度记录</p>
-          </div>
-        ) : (
-          <div className="space-y-2 border-t border-border px-2.5 py-2 sm:px-3">
-            {chunkDispatchGroups(groups).map((groupRow, rowIndex) => (
-              <div key={`dispatch-group-row-${rowIndex}`} className="grid min-w-0 gap-2 md:grid-cols-2 xl:grid-cols-3">
-                {groupRow.map((group) => {
-                  const groupAttempts = group.routes.reduce((sum, route) => sum + route.total_attempts, 0)
-                  return (
-                    <section
-                      key={group.gateway_group_id}
-                      aria-labelledby={`dispatch-group-${group.gateway_group_id}`}
-                      className="min-w-0 rounded-md border border-border bg-background"
-                    >
-                    <div className="flex items-center justify-between gap-2 border-b border-border bg-muted/20 px-2.5 py-1.5">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <span className="size-1.5 shrink-0 rounded-full bg-brand" />
-                        <h3 id={`dispatch-group-${group.gateway_group_id}`} className="truncate text-xs font-semibold text-foreground">
-                          {group.gateway_group_name}
-                        </h3>
-                      </div>
-                      <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{group.routes.length} 条路由</span>
-                    </div>
+  useEffect(() => {
+    if (!gatewayRef.current || !routeRef.current) return
+    gatewayChart.current ??= echarts.init(gatewayRef.current); routeChart.current ??= echarts.init(routeRef.current)
+    const gatewayPoints = new Map(groups.map((group) => [group.gateway_group_name, group.points]))
+    const routePoints = new Map(routes.map((route) => [route.route_name, route.points]))
+    gatewayChart.current.setOption(chartOption(groups.map((group) => group.gateway_group_name), gatewayPoints, metric, aggregation, bounds, visibleRange, "slider", selectedGatewayName), true)
+    routeChart.current.setOption(chartOption(routes.map((route) => route.route_name), routePoints, metric, aggregation, bounds, visibleRange, "follow", selectedRouteName), true)
+    gatewayChart.current.off("click").on("click", (params: echarts.ECElementEvent) => {
+      const group = typeof params.seriesIndex === "number" ? groups[params.seriesIndex] : groups.find((item) => item.gateway_group_name === params.seriesName)
+      if (group) setSelectedGatewayID(group.gateway_group_id)
+    })
+    routeChart.current.off("click").on("click", (params: echarts.ECElementEvent) => {
+      const route = typeof params.seriesIndex === "number" ? routes[params.seriesIndex] : routes.find((item) => item.route_name === params.seriesName)
+      if (route) setSelectedRouteID((current) => current === route.route_id ? null : route.route_id)
+    })
+    const onDataZoom = (...args: unknown[]) => {
+      const params = (args[0] ?? {}) as DataZoomEventParams
+      const zoom = params.batch?.[0] ?? params; const boundsFrom = Date.parse(bounds.from); const boundsTo = Date.parse(bounds.to); const step = bucketMilliseconds(bucket)
+      const rawStart = typeof zoom.startValue === "number" ? zoom.startValue : boundsFrom + ((zoom.start ?? 0) / 100) * (boundsTo - boundsFrom)
+      const rawEnd = typeof zoom.endValue === "number" ? zoom.endValue : boundsFrom + ((zoom.end ?? 100) / 100) * (boundsTo - boundsFrom)
+      const startValue = Math.max(boundsFrom, Math.min(rawStart, boundsTo - step)); const endValue = Math.min(boundsTo, Math.max(rawEnd, startValue + step))
+      if (!Number.isFinite(startValue) || !Number.isFinite(endValue) || endValue <= startValue) return
+      const nextFrom = new Date(startValue).toISOString(); const nextTo = new Date(endValue).toISOString()
+      if (nextFrom === visibleRangeRef.current.from && nextTo === visibleRangeRef.current.to) return
+      visibleRangeRef.current = { from: nextFrom, to: nextTo }
+      setVisibleRange({ from: nextFrom, to: nextTo })
+    }
+    gatewayChart.current.off("datazoom").on("datazoom", onDataZoom)
+    routeChart.current.off("datazoom")
+    const resize = () => { gatewayChart.current?.resize(); routeChart.current?.resize() }
+    window.addEventListener("resize", resize)
+    return () => window.removeEventListener("resize", resize)
+  }, [groups, routes, metric, aggregation, bounds, visibleRange, bucket, selectedGatewayName, selectedRouteName])
 
-                    <div className="divide-y divide-border">
-                      {group.routes.map((route) => {
-                        const tone = failureRateTone(route.failure_rate)
-                        const routeNavigable = isDispatchRouteNavigable(route)
-                        return (
-                          <div
-                            key={route.route_id}
-                            className="grid min-w-0 grid-cols-1 items-center gap-2 px-2.5 py-1.5 md:grid-cols-[minmax(110px,1fr)_minmax(165px,1.1fr)]"
-                            title={formatDispatchRouteMetric(route)}
-                          >
-                            <div className="flex min-w-0 items-center gap-2">
-                              <div className="flex size-5 shrink-0 items-center justify-center rounded bg-muted text-muted-foreground">
-                                <Route className="size-2.5" />
-                              </div>
-                              {routeNavigable ? (
-                                <button
-                                  type="button"
-                                  className="min-w-0 text-left outline-none focus-visible:rounded-sm focus-visible:ring-2 focus-visible:ring-ring/60"
-                                  onClick={() => navigate(dispatchRoutePath(group.gateway_group_id, route.route_id))}
-                                  title={`打开 ${formatDispatchRouteSource(route)} · 源分组 ${formatDispatchRouteGroup(route)}`}
-                                >
-                                  <p className="whitespace-normal break-words text-[11px] font-medium leading-4 text-foreground hover:text-brand">
-                                    {formatDispatchRouteSource(route)}
-                                  </p>
-                                  <p className="whitespace-normal break-words text-[10px] leading-3 text-muted-foreground">
-                                    源分组 {formatDispatchRouteGroup(route)} · 成本 {formatBillingRate(route.billing_rate_multiplier)}
-                                  </p>
-                                </button>
-                              ) : (
-                                <div className="min-w-0 text-left" title="历史路由，当前配置已删除">
-                                <p className="whitespace-normal break-words text-[11px] font-medium leading-4 text-foreground hover:text-brand">
-                                  {formatDispatchRouteSource(route)}
-                                </p>
-                                <p className="whitespace-normal break-words text-[10px] leading-3 text-muted-foreground">
-                                  历史路由 · {formatDispatchRouteGroup(route)} · 成本 {formatBillingRate(route.billing_rate_multiplier)}
-                                </p>
-                                </div>
-                              )}
-                            </div>
-                            <div className="min-w-0 space-y-1">
-                              <div
-                                className="flex min-w-0 items-center gap-1.5"
-                                title={`调用 ${route.total_attempts} 次，占组内 ${metricBarPercent(route.total_attempts, groupAttempts)}%`}
-                              >
-                                <span className="shrink-0 text-[9px] text-muted-foreground">调用</span>
-                                <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
-                                  <span
-                                    className="block h-full rounded-full bg-brand transition-[width]"
-                                    style={{ width: `${metricBarPercent(route.total_attempts, groupAttempts)}%` }}
-                                  />
-                                </div>
-                                <span className="shrink-0 text-[10px] font-semibold tabular-nums text-foreground">
-                                  {metricBarPercent(route.total_attempts, groupAttempts)}%
-                                </span>
-                              </div>
-                              <div className="flex min-w-0 items-center gap-1.5">
-                                <span className="shrink-0 text-[9px] text-muted-foreground">失败</span>
-                                <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
-                                  <span
-                                    className={cn("block h-full rounded-full transition-[width]", failureBarClass[tone])}
-                                    style={{ width: `${metricBarPercent(route.failure_rate)}%` }}
-                                  />
-                                </div>
-                                <span className={cn("shrink-0 text-[10px] font-semibold tabular-nums", failureTextClass[tone])}>
-                                  {formatFailureRate(route.failure_rate)}
-                                </span>
-                              </div>
-                              <div className="flex min-w-0 items-center gap-1.5">
-                                <span className="inline-flex shrink-0 items-center gap-0.5 text-[9px] text-muted-foreground">
-                                  <Timer className="size-2.5" />
-                                  首字
-                                </span>
-                                <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
-                                  <span
-                                    className="block h-full rounded-full bg-brand/70 transition-[width]"
-                                    style={{ width: `${metricBarPercent(route.average_first_token_ms, 1600)}%` }}
-                                  />
-                                </div>
-                                <span className="shrink-0 text-[10px] font-semibold tabular-nums text-foreground">
-                                  {formatFirstToken(route.average_first_token_ms)}
-                                </span>
-                              </div>
-                            </div>
-                          </div>
-                        )
-                      })}
-                    </div>
-                    </section>
-                  )
-                })}
-              </div>
-            ))}
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  )
+  const selectMetric = (next: DispatchTrendMetric) => { setMetric(next); const option = METRICS.find((item) => item.value === next)?.options[0]; if (option) setAggregation(option.value) }
+  const summary = trends.data ? `${new Date(visibleRange.from).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}–${new Date(visibleRange.to).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })} · ${trends.data.bucket}` : "加载中"
+
+  return <Card className="overflow-hidden border border-border py-2 shadow-none sm:py-3">
+    <CardHeader className="gap-2 px-3 pb-2 sm:flex sm:flex-row sm:items-center sm:justify-between sm:px-4"><CardTitle className="flex items-center gap-1.5 text-sm font-semibold"><Activity className="size-3.5 text-brand" />调度情况</CardTitle><div className="flex flex-wrap items-center justify-end gap-1.5"><div className="inline-flex rounded-md border border-border bg-muted/30 p-0.5">{METRICS.map((item) => <button key={item.value} type="button" onClick={() => selectMetric(item.value)} className={cn("h-6 rounded px-2 text-[11px]", metric === item.value ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>{item.label}</button>)}</div><select aria-label="统计口径" value={aggregation} onChange={(event) => setAggregation(event.target.value as DispatchTrendAggregation)} className="h-7 rounded-md border border-border bg-background px-2 text-[11px]">{activeMetric.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><span className="text-[10px] text-success">● 实时</span></div></CardHeader>
+    <CardContent className="px-3 pb-2 sm:px-4">{trends.error ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-sm text-danger">调度趋势加载失败：{trends.error}</p> : <div className="grid gap-4 lg:grid-cols-2">
+      <section className="min-w-0"><div className="mb-1 flex items-center justify-between"><h3 className="text-xs font-semibold">网关趋势</h3><span className="text-[10px] text-muted-foreground">{summary} · {activeMetric.options.find((item) => item.value === aggregation)?.label}</span></div><div ref={gatewayRef} className="h-64 min-h-[240px] w-full" /></section>
+      <section id="dispatch-route-trend" className="min-w-0 border-t border-border pt-3 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0"><div className="mb-1 flex items-center justify-between"><h3 className="text-xs font-semibold">路由趋势</h3><span className="rounded bg-brand/10 px-1.5 py-1 text-[10px] text-brand">网关：{currentGateway?.gateway_group_name ?? "暂无"}</span></div><div className="grid gap-3 sm:grid-cols-[minmax(132px,0.34fr)_minmax(0,1fr)]"><div className="max-h-64 overflow-y-auto rounded-md border border-border/70 bg-muted/20 p-1.5">{routes.length === 0 ? <p className="p-2 text-[11px] text-muted-foreground">暂无路由数据</p> : routes.map((route, index) => <button type="button" key={route.route_id} onClick={() => setSelectedRouteID((current) => current === route.route_id ? null : route.route_id)} aria-pressed={selectedRouteID === route.route_id} className={cn("flex w-full items-start gap-1.5 rounded px-1.5 py-1.5 text-left text-[11px] transition-colors hover:bg-background", selectedRouteID === route.route_id && "bg-background shadow-sm ring-1 ring-border")}><span className="mt-0.5 size-2.5 shrink-0 rounded-full" style={{ backgroundColor: COLORS[index % COLORS.length] }} /><span className="min-w-0"><span className="block truncate font-medium" title={route.route_name}>{route.route_name}</span><span className="block truncate text-[10px] text-muted-foreground" title={route.provider_name}>{route.provider_name || `${route.points.length} 个时间点`}</span></span></button>)}</div><div ref={routeRef} className="h-64 min-h-[240px] w-full" /></div></section>
+    </div>}</CardContent>
+  </Card>
 }
