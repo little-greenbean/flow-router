@@ -5,7 +5,7 @@ import { Activity } from "lucide-react"
 import * as echarts from "echarts"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useGatewayDispatchErrors, useGatewayDispatchTrends } from "@/lib/queries"
-import type { DispatchTrendAggregation, DispatchTrendMetric, GatewayDispatchErrors, GatewayDispatchTrendPoint } from "@/lib/api-types"
+import type { DispatchTrendAggregation, DispatchTrendMetric, GatewayDispatchErrorScope, GatewayDispatchTrendPoint } from "@/lib/api-types"
 import { cn } from "@/lib/utils"
 
 type ZoomMode = "slider" | "follow"
@@ -13,11 +13,16 @@ type DataZoomRange = { start?: number; end?: number; startValue?: number; endVal
 type DataZoomEventParams = DataZoomRange & { batch?: DataZoomRange[] }
 
 const COLORS = ["#2878bd", "#db7b2b", "#3d9a6d", "#c45050", "#7b61b3", "#1e969b"]
+const EMPTY_ERROR_SCOPE: GatewayDispatchErrorScope = {
+  requests: 0, final_failed: 0, error_rate: 0, recovered_requests: 0,
+  attempts: 0, failed_attempts: 0, attempt_error_rate: 0, categories: [], samples: [],
+}
+
 const ERROR_COLORS: Record<string, string> = {
   http: "#c45050", transport: "#db7b2b", config: "#7b61b3", internal: "#b3527d", client: "#6b7787", "": "#98a3b4",
 }
 
-function errorPieOption(data: GatewayDispatchErrors) {
+function errorPieOption(data: GatewayDispatchErrorScope) {
   const inner = data.categories.map((category) => ({
     name: category.label, value: category.count,
     itemStyle: { color: ERROR_COLORS[category.error_type] ?? "#98a3b4" },
@@ -170,6 +175,8 @@ export function DispatchHealthPanel() {
   const [aggregation, setAggregation] = useState<DispatchTrendAggregation>("p95")
   const [selectedGatewayID, setSelectedGatewayID] = useState<number | null>(null)
   const [selectedRouteID, setSelectedRouteID] = useState<number | null>(null)
+  const [errorGatewayID, setErrorGatewayID] = useState<number | null>(null)
+  const [errorRouteID, setErrorRouteID] = useState<number | null>(null)
   const bucket = "5m"
   const trends = useGatewayDispatchTrends(fullRange.from, fullRange.to, bucket)
   const errors = useGatewayDispatchErrors(visibleRange.from, visibleRange.to)
@@ -241,46 +248,99 @@ export function DispatchHealthPanel() {
   }, [groups, routes, metric, aggregation, bounds, visibleRange, bucket, selectedGatewayName, selectedRouteName])
 
   const errorData = errors.data
+  const errorGateway = errorGatewayID == null ? undefined : errorData?.groups.find((group) => group.gateway_group_id === errorGatewayID)
+  const errorRoute = errorRouteID == null ? undefined : errorGateway?.routes.find((route) => route.route_id === errorRouteID)
+  // 作用域优先级：路由 > 网关 > 全部；饼图和右侧明细都跟着它走。
+  const errorScope: GatewayDispatchErrorScope = errorRoute ?? errorGateway ?? errorData ?? EMPTY_ERROR_SCOPE
+  const scopeLabel = errorRoute ? `路由：${errorRoute.route_name}` : errorGateway ? `网关：${errorGateway.gateway_group_name}` : "全部网关"
+  // 选中的网关/路由若在新一轮数据里消失了，回落到上一级，避免停在空作用域。
+  useEffect(() => {
+    if (!errorData) return
+    if (errorGatewayID != null && !errorData.groups.some((group) => group.gateway_group_id === errorGatewayID)) { setErrorGatewayID(null); setErrorRouteID(null) }
+    else if (errorRouteID != null && errorGateway && !errorGateway.routes.some((route) => route.route_id === errorRouteID)) setErrorRouteID(null)
+  }, [errorData, errorGatewayID, errorRouteID, errorGateway])
   useEffect(() => {
     if (!errorRef.current) return
-    if (!errorData || errorData.categories.length === 0) { errorChart.current?.dispose(); errorChart.current = null; return }
+    if (errorScope.categories.length === 0) { errorChart.current?.dispose(); errorChart.current = null; return }
     errorChart.current ??= echarts.init(errorRef.current)
-    errorChart.current.setOption(errorPieOption(errorData), true)
+    errorChart.current.setOption(errorPieOption(errorScope), true)
     const resize = () => errorChart.current?.resize()
     window.addEventListener("resize", resize)
     return () => window.removeEventListener("resize", resize)
-  }, [errorData])
+  }, [errorScope])
 
   const selectMetric = (next: DispatchTrendMetric) => { setMetric(next); const option = METRICS.find((item) => item.value === next)?.options[0]; if (option) setAggregation(option.value) }
   const summary = trends.data ? `${new Date(visibleRange.from).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}–${new Date(visibleRange.to).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })} · ${trends.data.bucket}` : "加载中"
 
   return <Card className="overflow-hidden border border-border py-2 shadow-none sm:py-3">
     <CardHeader className="gap-2 px-3 pb-2 sm:flex sm:flex-row sm:items-center sm:justify-between sm:px-4"><CardTitle className="flex items-center gap-1.5 text-sm font-semibold"><Activity className="size-3.5 text-brand" />调度情况</CardTitle><div className="flex flex-wrap items-center justify-end gap-1.5"><div className="inline-flex rounded-md border border-border bg-muted/30 p-0.5">{METRICS.map((item) => <button key={item.value} type="button" onClick={() => selectMetric(item.value)} className={cn("h-6 rounded px-2 text-[11px]", metric === item.value ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>{item.label}</button>)}</div><select aria-label="统计口径" value={aggregation} onChange={(event) => setAggregation(event.target.value as DispatchTrendAggregation)} className="h-7 rounded-md border border-border bg-background px-2 text-[11px]">{activeMetric.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><span className="text-[10px] text-success">● 实时</span></div></CardHeader>
-    <CardContent className="px-3 pb-2 sm:px-4">{trends.error ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-sm text-danger">调度趋势加载失败：{trends.error}</p> : <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
+    <CardContent className="px-3 pb-2 sm:px-4">{trends.error ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-sm text-danger">调度趋势加载失败：{trends.error}</p> : <div className="grid gap-4 lg:grid-cols-2">
       <section className="min-w-0"><div className="mb-1 flex h-6 items-center justify-between"><h3 className="text-xs font-semibold">网关趋势</h3><span className="text-[10px] text-muted-foreground">{summary} · {activeMetric.options.find((item) => item.value === aggregation)?.label}</span></div><div className="grid gap-3 sm:grid-cols-[minmax(132px,0.34fr)_minmax(0,1fr)]"><div className="max-h-64 overflow-y-auto rounded-md border border-border/70 bg-muted/20 p-1.5">{groups.length === 0 ? <p className="p-2 text-[11px] text-muted-foreground">暂无网关数据</p> : groups.map((group, index) => <button type="button" key={group.gateway_group_id} onClick={() => setSelectedGatewayID((current) => current === group.gateway_group_id ? null : group.gateway_group_id)} aria-pressed={selectedGatewayID === group.gateway_group_id} className={cn("flex w-full items-start gap-1.5 rounded px-1.5 py-1.5 text-left text-[11px] transition-colors hover:bg-background", currentGateway?.gateway_group_id === group.gateway_group_id && "bg-background shadow-sm ring-1 ring-border")}><span className="mt-0.5 size-2.5 shrink-0 rounded-full" style={{ backgroundColor: COLORS[index % COLORS.length] }} /><span className="min-w-0"><span className="block truncate font-medium" title={group.gateway_group_name}>{group.gateway_group_name}</span><span className="block truncate text-[10px] text-muted-foreground">{group.routes?.length ?? 0} 条路由</span></span></button>)}</div><div ref={gatewayRef} className="h-64 min-h-[240px] w-full" /></div></section>
       <section id="dispatch-route-trend" className="min-w-0 border-t border-border pt-3 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0"><div className="mb-1 flex h-6 items-center justify-between"><h3 className="text-xs font-semibold">路由趋势</h3><span className="rounded bg-brand/10 px-1.5 py-1 text-[10px] text-brand">网关：{currentGateway?.gateway_group_name ?? "暂无"}</span></div><div className="grid gap-3 sm:grid-cols-[minmax(132px,0.34fr)_minmax(0,1fr)]"><div className="max-h-64 overflow-y-auto rounded-md border border-border/70 bg-muted/20 p-1.5">{routes.length === 0 ? <p className="p-2 text-[11px] text-muted-foreground">暂无路由数据</p> : routes.map((route, index) => <button type="button" key={route.route_id} onClick={() => setSelectedRouteID((current) => current === route.route_id ? null : route.route_id)} aria-pressed={selectedRouteID === route.route_id} className={cn("flex w-full items-start gap-1.5 rounded px-1.5 py-1.5 text-left text-[11px] transition-colors hover:bg-background", selectedRouteID === route.route_id && "bg-background shadow-sm ring-1 ring-border")}><span className="mt-0.5 size-2.5 shrink-0 rounded-full" style={{ backgroundColor: COLORS[index % COLORS.length] }} /><span className="min-w-0"><span className="block truncate font-medium" title={route.route_name}>{route.route_name}</span><span className="block truncate text-[10px] text-muted-foreground" title={route.provider_name}>{route.provider_name || `${route.points.length} 个时间点`}</span></span></button>)}</div><div ref={routeRef} className="h-64 min-h-[240px] w-full" /></div></section>
-      <section className="min-w-0 border-t border-border pt-3 xl:border-l xl:border-t-0 xl:pl-4 xl:pt-0">
-        <div className="mb-1 flex h-6 items-center justify-between"><h3 className="text-xs font-semibold">错误分布</h3><span className="text-[10px] text-muted-foreground">{errorData ? `${errorData.failed_attempts} 次失败尝试` : "加载中"}</span></div>
-        {errors.error ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-[11px] text-danger">错误分布加载失败：{errors.error}</p> : !errorData || errorData.categories.length === 0 ? <div className="flex h-64 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">当前窗口没有失败记录</div> : <div className="grid h-64 grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] gap-2">
-          <div className="flex flex-col">
+    </div>}
+
+    {/* 错误分布独占一行：三列挤在一起时字号被压到看不清，且原来只有全局口径，
+        定位不到具体网关和路由。这里改成 网关 → 路由 两级下钻 + 当前作用域的饼图与明细。 */}
+    {trends.error ? null : <div className="mt-3 border-t border-border pt-3">
+      <div className="mb-1.5 flex h-6 items-center justify-between">
+        <h3 className="text-xs font-semibold">错误分布</h3>
+        <div className="flex items-center gap-1.5 text-[10px]">
+          <span className="text-muted-foreground">范围</span>
+          <button type="button" onClick={() => { setErrorGatewayID(null); setErrorRouteID(null) }} className={cn("rounded px-1.5 py-0.5", errorGatewayID == null ? "bg-brand/10 font-medium text-brand" : "text-muted-foreground hover:bg-muted")}>全部网关</button>
+          {errorGateway ? <><span className="text-muted-foreground">›</span><button type="button" onClick={() => setErrorRouteID(null)} className={cn("max-w-40 truncate rounded px-1.5 py-0.5", errorRouteID == null ? "bg-brand/10 font-medium text-brand" : "text-muted-foreground hover:bg-muted")}>{errorGateway.gateway_group_name}</button></> : null}
+          {errorRoute ? <><span className="text-muted-foreground">›</span><span className="max-w-40 truncate rounded bg-brand/10 px-1.5 py-0.5 font-medium text-brand">{errorRoute.route_name}</span></> : null}
+        </div>
+      </div>
+      {errors.error ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-[11px] text-danger">错误分布加载失败：{errors.error}</p>
+        : !errorData ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">加载中…</div>
+        : errorData.failed_attempts === 0 ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">当前窗口没有失败记录</div>
+        : <div className="grid gap-3 lg:grid-cols-12">
+        <div className="min-w-0 lg:col-span-3">
+          <div className="mb-1 text-[10px] text-muted-foreground">按网关（失败尝试数降序）</div>
+          <div className="h-44 space-y-0.5 overflow-y-auto rounded-md border border-border/70 bg-muted/20 p-1.5">
+            {errorData.groups.map((group) => <button type="button" key={group.gateway_group_id} onClick={() => { setErrorGatewayID((current) => current === group.gateway_group_id ? null : group.gateway_group_id); setErrorRouteID(null) }} aria-pressed={errorGatewayID === group.gateway_group_id} className={cn("flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] transition-colors hover:bg-background", errorGatewayID === group.gateway_group_id && "bg-background shadow-sm ring-1 ring-border")}>
+              <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={group.gateway_group_name}>{group.gateway_group_name}</span><span className="block text-[10px] text-muted-foreground">{`最终失败 ${group.final_failed} / ${group.requests} 请求`}</span></span>
+              <span className="shrink-0 text-right"><span className="block text-[11px] font-semibold tabular-nums text-danger">{group.failed_attempts}</span><span className="block text-[9px] text-muted-foreground">失败尝试</span></span>
+            </button>)}
+          </div>
+        </div>
+        <div className="min-w-0 lg:col-span-3">
+          <div className="mb-1 truncate text-[10px] text-muted-foreground">{errorGateway ? `${errorGateway.gateway_group_name} 下的路由` : "选中一个网关后可下钻到路由"}</div>
+          <div className="h-44 space-y-0.5 overflow-y-auto rounded-md border border-border/70 bg-muted/20 p-1.5">
+            {!errorGateway ? <p className="p-2 text-[11px] text-muted-foreground">左侧点选网关</p>
+              : errorGateway.routes.filter((route) => route.failed_attempts > 0).length === 0 ? <p className="p-2 text-[11px] text-muted-foreground">该网关下没有失败的路由</p>
+              : errorGateway.routes.filter((route) => route.failed_attempts > 0).map((route) => <button type="button" key={route.route_id} onClick={() => setErrorRouteID((current) => current === route.route_id ? null : route.route_id)} aria-pressed={errorRouteID === route.route_id} className={cn("flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] transition-colors hover:bg-background", errorRouteID === route.route_id && "bg-background shadow-sm ring-1 ring-border")}>
+                <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={route.route_name}>{route.route_name}</span><span className="block truncate text-[10px] text-muted-foreground" title={route.provider_name}>{route.provider_name || `${route.attempts} 次尝试`}</span></span>
+                <span className="shrink-0 text-right"><span className="block text-[11px] font-semibold tabular-nums text-danger">{route.failed_attempts}</span><span className="block text-[9px] text-muted-foreground">{`${(route.attempt_error_rate * 100).toFixed(1)}%`}</span></span>
+              </button>)}
+          </div>
+        </div>
+        <div className="min-w-0 lg:col-span-3">
+          <div className="mb-1 truncate text-[10px] text-muted-foreground">{scopeLabel}</div>
+          <div className="flex h-44 flex-col rounded-md border border-border/70 bg-muted/20 p-1">
             <div ref={errorRef} className="min-h-0 w-full flex-1" />
-            <div className="grid grid-cols-3 gap-1 text-center">
-              <div><div className="text-[13px] font-semibold tabular-nums text-danger">{(errorData.error_rate * 100).toFixed(2)}%</div><div className="text-[10px] text-muted-foreground">错误率</div></div>
-              <div><div className="text-[13px] font-semibold tabular-nums">{errorData.final_failed}</div><div className="text-[10px] text-muted-foreground">最终失败</div></div>
-              <div><div className="text-[13px] font-semibold tabular-nums text-success">{errorData.recovered_requests}</div><div className="text-[10px] text-muted-foreground">顺延救回</div></div>
+            <div className="grid grid-cols-3 gap-1 pb-0.5 text-center">
+              <div><div className="text-[12px] font-semibold tabular-nums text-danger">{errorScope.failed_attempts}</div><div className="text-[9px] text-muted-foreground">失败尝试</div></div>
+              {errorRoute
+                ? <><div><div className="text-[12px] font-semibold tabular-nums">{errorScope.attempts}</div><div className="text-[9px] text-muted-foreground">总尝试</div></div><div><div className="text-[12px] font-semibold tabular-nums">{(errorScope.attempt_error_rate * 100).toFixed(1)}%</div><div className="text-[9px] text-muted-foreground">尝试失败率</div></div></>
+                : <><div><div className="text-[12px] font-semibold tabular-nums">{errorScope.final_failed}</div><div className="text-[9px] text-muted-foreground">最终失败</div></div><div><div className="text-[12px] font-semibold tabular-nums text-success">{errorScope.recovered_requests}</div><div className="text-[9px] text-muted-foreground">顺延救回</div></div></>}
             </div>
           </div>
-          <div className="flex min-h-0 flex-col gap-1.5">
-            <div className="flex flex-wrap gap-x-2 gap-y-1">{errorData.categories.map((category) => <span key={category.error_type} className="inline-flex items-center gap-1 text-[10px] text-muted-foreground"><span className="size-2 rounded-full" style={{ backgroundColor: ERROR_COLORS[category.error_type] ?? "#98a3b4" }} />{category.label} {category.count}</span>)}</div>
-            <div className="min-h-0 flex-1 space-y-1 overflow-y-auto rounded-md border border-border/70 bg-muted/20 p-1.5">
-              {errorData.samples.map((sample) => <div key={`${sample.error_type}-${sample.status_code}-${sample.message}`} className="rounded px-1 py-1 text-[10px] leading-tight">
-                <div className="flex items-center justify-between gap-1"><span className="inline-flex items-center gap-1 font-medium" style={{ color: ERROR_COLORS[sample.error_type] ?? "#98a3b4" }}>{sample.status_code > 0 ? sample.status_code : "无响应"}</span><span className="tabular-nums text-muted-foreground">{sample.count} 次</span></div>
+        </div>
+        <div className="min-w-0 lg:col-span-3">
+          <div className="mb-1 text-[10px] text-muted-foreground">错误类型与高频错误</div>
+          <div className="flex h-44 flex-col gap-1 rounded-md border border-border/70 bg-muted/20 p-1.5">
+            <div className="flex flex-wrap gap-x-2 gap-y-0.5">{errorScope.categories.map((category) => <span key={category.error_type} className="inline-flex items-center gap-1 text-[10px] text-muted-foreground"><span className="size-2 rounded-full" style={{ backgroundColor: ERROR_COLORS[category.error_type] ?? "#98a3b4" }} />{category.label} {category.count}</span>)}</div>
+            <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto">
+              {errorScope.samples.map((sample) => <div key={`${sample.error_type}-${sample.status_code}-${sample.message}`} className="rounded px-1 py-0.5 text-[10px] leading-tight">
+                <div className="flex items-center justify-between gap-1"><span className="font-medium" style={{ color: ERROR_COLORS[sample.error_type] ?? "#98a3b4" }}>{sample.status_code > 0 ? sample.status_code : "无响应"}</span><span className="tabular-nums text-muted-foreground">{sample.count} 次</span></div>
                 <div className="truncate text-muted-foreground" title={sample.message}>{sample.message}</div>
               </div>)}
             </div>
           </div>
-        </div>}
-      </section>
-    </div>}</CardContent>
+        </div>
+      </div>}
+    </div>}
+    </CardContent>
   </Card>
 }

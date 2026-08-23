@@ -32,10 +32,12 @@ SELECT g.id,0,rte.id,0,0,r.provider_name,r.key_name,r.source_name,r.rate,r.rate,
 FROM routes r JOIN gateway_groups g ON g.name=r.group_name JOIN gateway_routes rte ON rte.gateway_group_id=g.id AND rte.source_api_key_name=r.key_name CROSS JOIN minutes m;
 -- 每个失败主请求补一条顺延尝试，形成真实 request_id 链。
 -- 75% 顺延成功（可恢复），25% 顺延后仍失败（最终失败），这样错误率不会恒为 0。
--- 注意：SQLite 的字符串拼接是 ||，用 + 会做数值强转把 provider_name 写成 0。
+-- 顺延尝试落在组内另一条**真实**路由上，所以 source_api_key_name 必须取那条路由
+-- 自己的名字：路由名 = 最后出现的 source_api_key_name，硬写 'failover-key' 会把
+-- 真实路由名覆盖掉，UI 上会出现两条同名路由。provider_name 留空，交给该路由的主请求行。
 WITH failed AS (SELECT l.*,g.name AS group_name FROM gateway_usage_logs l JOIN gateway_groups g ON g.id=l.gateway_group_id WHERE l.request_id LIKE 'mock-dispatch-v2-%' AND l.success=0)
 INSERT INTO gateway_usage_logs (gateway_group_id,gateway_key_id,route_id,channel_id,gateway_provider_id,provider_name,source_api_key_name,source_group_name,billing_rate_multiplier,rate_multiplier,request_id,attempt,attempt_kind,requested_model,upstream_model,inbound_endpoint,upstream_endpoint,inbound_protocol,upstream_protocol,billing_mode,status_code,success,duration_ms,first_token_ms,created_at,error_type,error_message)
-SELECT f.gateway_group_id,0,COALESCE((SELECT id FROM gateway_routes WHERE gateway_group_id=f.gateway_group_id AND id<>f.route_id ORDER BY position LIMIT 1),f.route_id),0,0,'Failover '||f.provider_name,'failover-key','备用顺延池',1,1,f.request_id,2,'failover',f.requested_model,f.upstream_model,f.inbound_endpoint,f.upstream_endpoint,f.inbound_protocol,f.upstream_protocol,f.billing_mode,
+SELECT f.gateway_group_id,0,COALESCE((SELECT id FROM gateway_routes WHERE gateway_group_id=f.gateway_group_id AND id<>f.route_id ORDER BY position LIMIT 1),f.route_id),0,0,'',COALESCE((SELECT source_api_key_name FROM gateway_routes WHERE gateway_group_id=f.gateway_group_id AND id<>f.route_id ORDER BY position LIMIT 1),f.source_api_key_name),'备用顺延池',1,1,f.request_id,2,'failover',f.requested_model,f.upstream_model,f.inbound_endpoint,f.upstream_endpoint,f.inbound_protocol,f.upstream_protocol,f.billing_mode,
   CASE WHEN abs(f.id*7)%4=0 THEN 503 ELSE 200 END,
   CASE WHEN abs(f.id*7)%4=0 THEN 0 ELSE 1 END,
   f.duration_ms+420,

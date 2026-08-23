@@ -859,25 +859,42 @@ type GatewayDispatchErrorSample struct {
 	LastSeen   time.Time `json:"last_seen"`
 }
 
-type GatewayDispatchErrorGroup struct {
-	GatewayGroupID   uint   `json:"gateway_group_id"`
-	GatewayGroupName string `json:"gateway_group_name"`
-	Requests         int    `json:"requests"`
-	FinalFailed      int    `json:"final_failed"`
-}
-
-type GatewayDispatchErrors struct {
-	From              time.Time                      `json:"from"`
-	To                time.Time                      `json:"to"`
+// GatewayDispatchErrorScope 是「总体 / 单个网关 / 单条路由」三层共用的统计口径。
+// Requests / FinalFailed / ErrorRate / Recovered 是**请求链**口径（一条请求 = 一条
+// group:request_id 链，最终失败 = 链上最后一次尝试失败）；Attempts / FailedAttempts
+// 以及由此产出的 Categories / Samples 是**尝试**口径，含被顺延救回的那些失败。
+// 路由层没有「最终失败」概念（顺延后可能由别的路由收尾），所以路由只填尝试口径。
+type GatewayDispatchErrorScope struct {
 	Requests          int                            `json:"requests"`
 	FinalFailed       int                            `json:"final_failed"`
 	ErrorRate         float64                        `json:"error_rate"`
+	RecoveredRequests int                            `json:"recovered_requests"`
 	Attempts          int                            `json:"attempts"`
 	FailedAttempts    int                            `json:"failed_attempts"`
-	RecoveredRequests int                            `json:"recovered_requests"`
+	AttemptErrorRate  float64                        `json:"attempt_error_rate"`
 	Categories        []GatewayDispatchErrorCategory `json:"categories"`
 	Samples           []GatewayDispatchErrorSample   `json:"samples"`
-	Groups            []GatewayDispatchErrorGroup    `json:"groups"`
+}
+
+type GatewayDispatchErrorRoute struct {
+	RouteID      uint   `json:"route_id"`
+	RouteName    string `json:"route_name"`
+	ProviderName string `json:"provider_name,omitempty"`
+	GatewayDispatchErrorScope
+}
+
+type GatewayDispatchErrorGroup struct {
+	GatewayGroupID   uint   `json:"gateway_group_id"`
+	GatewayGroupName string `json:"gateway_group_name"`
+	GatewayDispatchErrorScope
+	Routes []GatewayDispatchErrorRoute `json:"routes"`
+}
+
+type GatewayDispatchErrors struct {
+	From time.Time `json:"from"`
+	To   time.Time `json:"to"`
+	GatewayDispatchErrorScope
+	Groups []GatewayDispatchErrorGroup `json:"groups"`
 }
 
 func dispatchErrorTypeLabel(errorType string) string {
@@ -906,10 +923,110 @@ func dispatchStatusCodeLabel(code int) string {
 	return strconv.Itoa(code)
 }
 
-// DispatchErrors 汇总窗口内的失败分布。请求口径与 DispatchTrends 一致：
-// 一条「请求」= 一条 gateway_group_id:request_id 链，最终失败 = 链上最后一次尝试失败。
-// Categories 统计的是**所有失败尝试**（含被顺延救回的），因为排障关心的是错误本身
-// 出现了多少次；FinalFailed / ErrorRate 才是面向用户的最终失败口径。
+type dispatchSampleAcc struct {
+	message    string
+	errorType  string
+	statusCode int
+	count      int
+	lastSeen   time.Time
+}
+
+// dispatchErrorAcc 累加一个作用域内的尝试口径统计，总体/网关/路由三层共用。
+type dispatchErrorAcc struct {
+	attempts       int
+	failedAttempts int
+	typeCounts     map[string]int
+	codeCounts     map[string]map[int]int
+	samples        map[string]*dispatchSampleAcc
+}
+
+func newDispatchErrorAcc() *dispatchErrorAcc {
+	return &dispatchErrorAcc{
+		typeCounts: make(map[string]int),
+		codeCounts: make(map[string]map[int]int),
+		samples:    make(map[string]*dispatchSampleAcc),
+	}
+}
+
+func (a *dispatchErrorAcc) add(log GatewayUsageLog) {
+	a.attempts++
+	if log.Success {
+		return
+	}
+	a.failedAttempts++
+	a.typeCounts[log.ErrorType]++
+	if a.codeCounts[log.ErrorType] == nil {
+		a.codeCounts[log.ErrorType] = make(map[int]int)
+	}
+	a.codeCounts[log.ErrorType][log.StatusCode]++
+	message := strings.TrimSpace(log.ErrorMessage)
+	if message == "" {
+		message = dispatchErrorTypeLabel(log.ErrorType)
+	}
+	if len([]rune(message)) > 160 {
+		message = string([]rune(message)[:160]) + "…"
+	}
+	key := fmt.Sprintf("%s|%d|%s", log.ErrorType, log.StatusCode, message)
+	sample := a.samples[key]
+	if sample == nil {
+		sample = &dispatchSampleAcc{message: message, errorType: log.ErrorType, statusCode: log.StatusCode}
+		a.samples[key] = sample
+	}
+	sample.count++
+	if log.CreatedAt.After(sample.lastSeen) {
+		sample.lastSeen = log.CreatedAt
+	}
+}
+
+func (a *dispatchErrorAcc) fill(scope *GatewayDispatchErrorScope) {
+	scope.Attempts = a.attempts
+	scope.FailedAttempts = a.failedAttempts
+	if a.attempts > 0 {
+		scope.AttemptErrorRate = float64(a.failedAttempts) / float64(a.attempts)
+	}
+	scope.Categories = make([]GatewayDispatchErrorCategory, 0, len(a.typeCounts))
+	for errorType, count := range a.typeCounts {
+		category := GatewayDispatchErrorCategory{
+			ErrorType: errorType, Label: dispatchErrorTypeLabel(errorType), Count: count,
+			Codes: make([]GatewayDispatchErrorCode, 0, len(a.codeCounts[errorType])),
+		}
+		for code, codeCount := range a.codeCounts[errorType] {
+			category.Codes = append(category.Codes, GatewayDispatchErrorCode{StatusCode: code, Label: dispatchStatusCodeLabel(code), Count: codeCount})
+		}
+		sort.Slice(category.Codes, func(i, j int) bool {
+			if category.Codes[i].Count != category.Codes[j].Count {
+				return category.Codes[i].Count > category.Codes[j].Count
+			}
+			return category.Codes[i].StatusCode < category.Codes[j].StatusCode
+		})
+		scope.Categories = append(scope.Categories, category)
+	}
+	sort.Slice(scope.Categories, func(i, j int) bool {
+		if scope.Categories[i].Count != scope.Categories[j].Count {
+			return scope.Categories[i].Count > scope.Categories[j].Count
+		}
+		return scope.Categories[i].ErrorType < scope.Categories[j].ErrorType
+	})
+	scope.Samples = make([]GatewayDispatchErrorSample, 0, len(a.samples))
+	for _, sample := range a.samples {
+		scope.Samples = append(scope.Samples, GatewayDispatchErrorSample{
+			Message: sample.message, ErrorType: sample.errorType, StatusCode: sample.statusCode,
+			Count: sample.count, LastSeen: sample.lastSeen,
+		})
+	}
+	sort.Slice(scope.Samples, func(i, j int) bool {
+		if scope.Samples[i].Count != scope.Samples[j].Count {
+			return scope.Samples[i].Count > scope.Samples[j].Count
+		}
+		return scope.Samples[i].Message < scope.Samples[j].Message
+	})
+	if len(scope.Samples) > 8 {
+		scope.Samples = scope.Samples[:8]
+	}
+}
+
+// DispatchErrors 汇总窗口内的失败分布，输出「总体 → 网关 → 路由」三层，
+// 供前端下钻定位到具体网关和网关下的具体路由。口径见 GatewayDispatchErrorScope。
 func (r *GatewayUsageLogs) DispatchErrors(from, to time.Time) (GatewayDispatchErrors, error) {
 	if from.IsZero() || to.IsZero() || !to.After(from) {
 		return GatewayDispatchErrors{}, fmt.Errorf("invalid dispatch error range")
@@ -922,160 +1039,138 @@ func (r *GatewayUsageLogs) DispatchErrors(from, to time.Time) (GatewayDispatchEr
 	if err := query.Order("created_at ASC, id ASC").Find(&logs).Error; err != nil {
 		return GatewayDispatchErrors{}, err
 	}
-	result := GatewayDispatchErrors{
-		From: from, To: to,
-		Categories: []GatewayDispatchErrorCategory{},
-		Samples:    []GatewayDispatchErrorSample{},
-		Groups:     []GatewayDispatchErrorGroup{},
-	}
+	result := GatewayDispatchErrors{From: from, To: to, Groups: []GatewayDispatchErrorGroup{}}
+	totalAcc := newDispatchErrorAcc()
+	totalAcc.fill(&result.GatewayDispatchErrorScope)
 	if len(logs) == 0 {
 		return result, nil
 	}
 
+	type routeAgg struct {
+		name     string
+		provider string
+		acc      *dispatchErrorAcc
+		chains   map[string]struct{}
+	}
+	type groupAgg struct {
+		name   string
+		acc    *dispatchErrorAcc
+		routes map[uint]*routeAgg
+	}
 	type chainState struct {
 		groupID   uint
 		lastOK    bool
-		attempts  int
 		anyFailed bool
 	}
+
+	groups := make(map[uint]*groupAgg)
+	groupOrder := make([]uint, 0)
 	chains := make(map[string]*chainState)
-	order := make([]string, 0)
-	groupNames := make(map[uint]string)
-	codeCounts := make(map[string]map[int]int)
-	typeCounts := make(map[string]int)
-	type sampleState struct {
-		count      int
-		errorType  string
-		statusCode int
-		lastSeen   time.Time
-	}
-	samples := make(map[string]*sampleState)
+	chainOrder := make([]string, 0)
 
 	for _, log := range logs {
+		group := groups[log.GatewayGroupID]
+		if group == nil {
+			group = &groupAgg{name: fmt.Sprintf("组 #%d", log.GatewayGroupID), acc: newDispatchErrorAcc(), routes: make(map[uint]*routeAgg)}
+			groups[log.GatewayGroupID] = group
+			groupOrder = append(groupOrder, log.GatewayGroupID)
+		}
+		route := group.routes[log.RouteID]
+		if route == nil {
+			route = &routeAgg{name: fmt.Sprintf("路由 #%d", log.RouteID), acc: newDispatchErrorAcc(), chains: make(map[string]struct{})}
+			group.routes[log.RouteID] = route
+		}
+		// 与 DispatchTrends 保持一致：路由名取最后出现的 SourceAPIKeyName，
+		// provider 取首个非空值。
+		if log.SourceAPIKeyName != "" {
+			route.name = log.SourceAPIKeyName
+		}
+		if route.provider == "" {
+			route.provider = log.ProviderName
+		}
+		route.chains[log.RequestID] = struct{}{}
+
+		totalAcc.add(log)
+		group.acc.add(log)
+		route.acc.add(log)
+
 		key := fmt.Sprintf("%d:%s", log.GatewayGroupID, log.RequestID)
 		state := chains[key]
 		if state == nil {
 			state = &chainState{groupID: log.GatewayGroupID}
 			chains[key] = state
-			order = append(order, key)
+			chainOrder = append(chainOrder, key)
 		}
-		state.attempts++
 		state.lastOK = log.Success
-		if _, ok := groupNames[log.GatewayGroupID]; !ok {
-			groupNames[log.GatewayGroupID] = fmt.Sprintf("组 #%d", log.GatewayGroupID)
-		}
-		result.Attempts++
-		if log.Success {
-			continue
-		}
-		state.anyFailed = true
-		result.FailedAttempts++
-		typeCounts[log.ErrorType]++
-		if codeCounts[log.ErrorType] == nil {
-			codeCounts[log.ErrorType] = make(map[int]int)
-		}
-		codeCounts[log.ErrorType][log.StatusCode]++
-		message := strings.TrimSpace(log.ErrorMessage)
-		if message == "" {
-			message = dispatchErrorTypeLabel(log.ErrorType)
-		}
-		if len([]rune(message)) > 160 {
-			message = string([]rune(message)[:160]) + "…"
-		}
-		sampleKey := fmt.Sprintf("%s|%d|%s", log.ErrorType, log.StatusCode, message)
-		if samples[sampleKey] == nil {
-			samples[sampleKey] = &sampleState{errorType: log.ErrorType, statusCode: log.StatusCode}
-		}
-		samples[sampleKey].count++
-		if log.CreatedAt.After(samples[sampleKey].lastSeen) {
-			samples[sampleKey].lastSeen = log.CreatedAt
+		if !log.Success {
+			state.anyFailed = true
 		}
 	}
 
-	groupStats := make(map[uint]*GatewayDispatchErrorGroup)
-	for _, key := range order {
+	groupChainStats := make(map[uint]*GatewayDispatchErrorScope)
+	for _, key := range chainOrder {
 		state := chains[key]
-		result.Requests++
-		stat := groupStats[state.groupID]
+		stat := groupChainStats[state.groupID]
 		if stat == nil {
-			stat = &GatewayDispatchErrorGroup{GatewayGroupID: state.groupID}
-			groupStats[state.groupID] = stat
+			stat = &GatewayDispatchErrorScope{}
+			groupChainStats[state.groupID] = stat
 		}
+		result.Requests++
 		stat.Requests++
 		if !state.lastOK {
 			result.FinalFailed++
 			stat.FinalFailed++
 		} else if state.anyFailed {
 			result.RecoveredRequests++
+			stat.RecoveredRequests++
 		}
 	}
 	if result.Requests > 0 {
 		result.ErrorRate = float64(result.FinalFailed) / float64(result.Requests)
 	}
+	totalAcc.fill(&result.GatewayDispatchErrorScope)
 
 	var dbGroups []GatewayGroup
-	if err := r.db.Where("id IN ?", keysUint(groupNames)).Find(&dbGroups).Error; err == nil {
-		for _, group := range dbGroups {
-			groupNames[group.ID] = group.Name
+	if err := r.db.Where("id IN ?", groupOrder).Find(&dbGroups).Error; err == nil {
+		for _, dbGroup := range dbGroups {
+			if group := groups[dbGroup.ID]; group != nil {
+				group.name = dbGroup.Name
+			}
 		}
 	}
-	for id, stat := range groupStats {
-		stat.GatewayGroupName = groupNames[id]
-		result.Groups = append(result.Groups, *stat)
+
+	for _, groupID := range groupOrder {
+		group := groups[groupID]
+		item := GatewayDispatchErrorGroup{GatewayGroupID: groupID, GatewayGroupName: group.name, Routes: []GatewayDispatchErrorRoute{}}
+		if stat := groupChainStats[groupID]; stat != nil {
+			item.Requests = stat.Requests
+			item.FinalFailed = stat.FinalFailed
+			item.RecoveredRequests = stat.RecoveredRequests
+			if stat.Requests > 0 {
+				item.ErrorRate = float64(stat.FinalFailed) / float64(stat.Requests)
+			}
+		}
+		group.acc.fill(&item.GatewayDispatchErrorScope)
+		for routeID, route := range group.routes {
+			routeItem := GatewayDispatchErrorRoute{RouteID: routeID, RouteName: route.name, ProviderName: route.provider}
+			routeItem.Requests = len(route.chains)
+			route.acc.fill(&routeItem.GatewayDispatchErrorScope)
+			item.Routes = append(item.Routes, routeItem)
+		}
+		sort.Slice(item.Routes, func(i, j int) bool {
+			if item.Routes[i].FailedAttempts != item.Routes[j].FailedAttempts {
+				return item.Routes[i].FailedAttempts > item.Routes[j].FailedAttempts
+			}
+			return item.Routes[i].RouteID < item.Routes[j].RouteID
+		})
+		result.Groups = append(result.Groups, item)
 	}
 	sort.Slice(result.Groups, func(i, j int) bool {
-		if result.Groups[i].FinalFailed != result.Groups[j].FinalFailed {
-			return result.Groups[i].FinalFailed > result.Groups[j].FinalFailed
+		if result.Groups[i].FailedAttempts != result.Groups[j].FailedAttempts {
+			return result.Groups[i].FailedAttempts > result.Groups[j].FailedAttempts
 		}
 		return result.Groups[i].GatewayGroupID < result.Groups[j].GatewayGroupID
 	})
-
-	for errorType, count := range typeCounts {
-		category := GatewayDispatchErrorCategory{
-			ErrorType: errorType,
-			Label:     dispatchErrorTypeLabel(errorType),
-			Count:     count,
-			Codes:     []GatewayDispatchErrorCode{},
-		}
-		for code, codeCount := range codeCounts[errorType] {
-			category.Codes = append(category.Codes, GatewayDispatchErrorCode{StatusCode: code, Label: dispatchStatusCodeLabel(code), Count: codeCount})
-		}
-		sort.Slice(category.Codes, func(i, j int) bool {
-			if category.Codes[i].Count != category.Codes[j].Count {
-				return category.Codes[i].Count > category.Codes[j].Count
-			}
-			return category.Codes[i].StatusCode < category.Codes[j].StatusCode
-		})
-		result.Categories = append(result.Categories, category)
-	}
-	sort.Slice(result.Categories, func(i, j int) bool {
-		if result.Categories[i].Count != result.Categories[j].Count {
-			return result.Categories[i].Count > result.Categories[j].Count
-		}
-		return result.Categories[i].ErrorType < result.Categories[j].ErrorType
-	})
-
-	for key, sample := range samples {
-		message := key
-		if index := strings.Index(key, "|"); index >= 0 {
-			if second := strings.Index(key[index+1:], "|"); second >= 0 {
-				message = key[index+1+second+1:]
-			}
-		}
-		result.Samples = append(result.Samples, GatewayDispatchErrorSample{
-			Message: message, ErrorType: sample.errorType, StatusCode: sample.statusCode,
-			Count: sample.count, LastSeen: sample.lastSeen,
-		})
-	}
-	sort.Slice(result.Samples, func(i, j int) bool {
-		if result.Samples[i].Count != result.Samples[j].Count {
-			return result.Samples[i].Count > result.Samples[j].Count
-		}
-		return result.Samples[i].Message < result.Samples[j].Message
-	})
-	if len(result.Samples) > 8 {
-		result.Samples = result.Samples[:8]
-	}
 	return result, nil
 }
 

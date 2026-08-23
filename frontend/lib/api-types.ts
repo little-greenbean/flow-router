@@ -968,24 +968,39 @@ export interface GatewayDispatchErrorSample {
   last_seen: string
 }
 
-export interface GatewayDispatchErrorGroup {
-  gateway_group_id: number
-  gateway_group_name: string
-  requests: number
-  final_failed: number
-}
-
-export interface GatewayDispatchErrors {
-  from: string
-  to: string
+/**
+ * 总体 / 网关 / 路由三层共用的统计口径。
+ * requests / final_failed / error_rate / recovered_requests 是请求链口径；
+ * attempts / failed_attempts / attempt_error_rate 及 categories、samples 是尝试口径。
+ * 路由层没有「最终失败」概念（顺延后可能由别的路由收尾），只有尝试口径有意义。
+ */
+export interface GatewayDispatchErrorScope {
   requests: number
   final_failed: number
   error_rate: number
+  recovered_requests: number
   attempts: number
   failed_attempts: number
-  recovered_requests: number
+  attempt_error_rate: number
   categories: GatewayDispatchErrorCategory[]
   samples: GatewayDispatchErrorSample[]
+}
+
+export interface GatewayDispatchErrorRoute extends GatewayDispatchErrorScope {
+  route_id: number
+  route_name: string
+  provider_name?: string
+}
+
+export interface GatewayDispatchErrorGroup extends GatewayDispatchErrorScope {
+  gateway_group_id: number
+  gateway_group_name: string
+  routes: GatewayDispatchErrorRoute[]
+}
+
+export interface GatewayDispatchErrors extends GatewayDispatchErrorScope {
+  from: string
+  to: string
   groups: GatewayDispatchErrorGroup[]
 }
 
