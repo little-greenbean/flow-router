@@ -13,6 +13,7 @@ import type {
   DashboardSummary,
   GatewayDispatchStats,
   GatewayDispatchErrors,
+  GatewayDispatchScorecard,
   GatewayDispatchTrends,
   GatewayDispatchWindow,
   GatewayUsageStats,
@@ -169,6 +170,14 @@ export function useGatewayDispatchErrors(from?: string, to?: string) {
   if (to) qs.set("to", to)
   const suffix = qs.toString()
   return useApi<GatewayDispatchErrors>(`/gateway/dispatch/errors${suffix ? `?${suffix}` : ""}`)
+}
+
+export function useGatewayDispatchScorecard(from?: string, to?: string) {
+  const qs = new URLSearchParams()
+  if (from) qs.set("from", from)
+  if (to) qs.set("to", to)
+  const suffix = qs.toString()
+  return useApi<GatewayDispatchScorecard>(`/gateway/dispatch/scorecard${suffix ? `?${suffix}` : ""}`)
 }
 
 export function useAppVersion() {

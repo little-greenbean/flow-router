@@ -13,6 +13,8 @@ import {
   isDispatchRouteNavigable,
   formatFailureRate,
   formatFirstToken,
+  formatScoreRouteIdentity,
+  formatTTFT,
 } from "./dispatch-health-utils.ts"
 
 test("chunks gateway groups into three-column rows without reordering", () => {
@@ -84,4 +86,28 @@ test("only links routes that still exist in the current gateway config", () => {
   assert.equal(isDispatchRouteNavigable({ route_available: true }), true)
   assert.equal(isDispatchRouteNavigable({ route_available: false }), false)
   assert.equal(isDispatchRouteNavigable({}), true)
+})
+
+test("route identity prefers source and source group over the key name", () => {
+  assert.equal(
+    formatScoreRouteIdentity({ source_name: "55", source_group_name: "GPT-特惠-Plus", key_name: "uops-ch9-sgn-GPT-3d50", route_id: 7 }),
+    "55 · GPT-特惠-Plus",
+  )
+  assert.equal(formatScoreRouteIdentity({ source_name: "55", route_id: 7 }), "55")
+  assert.equal(formatScoreRouteIdentity({ source_group_name: "GPT-特惠-Plus", route_id: 7 }), "GPT-特惠-Plus")
+})
+
+test("route identity falls back to the key name, then the route id", () => {
+  assert.equal(formatScoreRouteIdentity({ key_name: "uops-ch9-3d50", route_id: 7 }), "uops-ch9-3d50")
+  assert.equal(formatScoreRouteIdentity({ route_id: 7 }), "路由 #7")
+  // 全是空白串时也要退到 id，而不是显示一串空格
+  assert.equal(formatScoreRouteIdentity({ source_name: "  ", source_group_name: "", key_name: " ", route_id: 7 }), "路由 #7")
+})
+
+test("TTFT formats by magnitude and marks missing samples", () => {
+  assert.equal(formatTTFT(0), "—")
+  assert.equal(formatTTFT(-1), "—")
+  assert.equal(formatTTFT(842), "842ms")
+  assert.equal(formatTTFT(1000), "1.0s")
+  assert.equal(formatTTFT(12400), "12.4s")
 })

@@ -1355,3 +1355,170 @@ func TestGatewayUsageDispatchErrorsRejectsBadRange(t *testing.T) {
 		t.Fatal("expected error for zero from")
 	}
 }
+
+func TestGatewayUsageDispatchScorecardRanksRoutes(t *testing.T) {
+	db := openTestDB(t)
+	usage := NewGatewayUsageLogs(db)
+	if err := db.Create(&GatewayGroup{ID: 31, Name: "记分卡网关"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&Channel{ID: 7, Name: "渠道七", Type: ChannelTypeNewAPI, SiteURL: "https://x", Username: "u"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 路由 11 还活着且启用；路由 12 已被删除（只剩历史日志）
+	if err := db.Create(&GatewayRoute{ID: 11, GatewayGroupID: 31, Position: 0, SourceChannelID: 7, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	to := from.Add(10 * time.Minute)
+	ttft := func(ms int64) *int64 { return &ms }
+	rows := []GatewayUsageLog{
+		// sc-1：路由 11 因 403 失败（P0，需人工），顺延到路由 12 成功 → 链顺延 1 次
+		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceGroupName: "源组A", SourceAPIKeyName: "uops-key-a", RequestID: "sc-1", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 403, ErrorMessage: "余额不足", CreatedAt: from.Add(10 * time.Second)},
+		{GatewayGroupID: 31, RouteID: 12, ProviderName: "供应商B", SourceGroupName: "源组B", SourceAPIKeyName: "uops-key-b", RequestID: "sc-1", Attempt: 2, AttemptKind: "failover", Success: true, FirstTokenMS: ttft(800), CreatedAt: from.Add(11 * time.Second)},
+		// sc-2：路由 11 再次 403 → 顺延两次才成功，链顺延 2 次
+		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceAPIKeyName: "uops-key-a", RequestID: "sc-2", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 403, ErrorMessage: "余额不足", CreatedAt: from.Add(1 * time.Minute)},
+		{GatewayGroupID: 31, RouteID: 12, RequestID: "sc-2", Attempt: 2, AttemptKind: "failover", Success: false, ErrorType: "http", StatusCode: 502, ErrorMessage: "网关错误", CreatedAt: from.Add(61 * time.Second)},
+		{GatewayGroupID: 31, RouteID: 12, RequestID: "sc-2", Attempt: 3, AttemptKind: "failover", Success: true, FirstTokenMS: ttft(1200), CreatedAt: from.Add(62 * time.Second)},
+		// sc-3：路由 11 成功一次
+		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, RequestID: "sc-3", Attempt: 1, Success: true, FirstTokenMS: ttft(400), CreatedAt: from.Add(2 * time.Minute)},
+		// sc-4：路由 12 被客户端断开（P2，噪声）
+		{GatewayGroupID: 31, RouteID: 12, RequestID: "sc-4", Attempt: 1, Success: false, ErrorType: "client", StatusCode: 499, ErrorMessage: "客户端断开", CreatedAt: from.Add(3 * time.Minute)},
+	}
+	for i := range rows {
+		if err := usage.Create(&rows[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := usage.DispatchScorecard(from, to)
+	if err != nil {
+		t.Fatalf("dispatch scorecard: %v", err)
+	}
+	if len(got.Routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(got.Routes))
+	}
+	// P0 最多的排最前面 → 路由 11（两次 403）
+	first := got.Routes[0]
+	if first.RouteID != 11 {
+		t.Fatalf("first route = %d, want 11 (P0 最多)", first.RouteID)
+	}
+	if first.Severity.P0 != 2 || first.Severity.P1 != 0 || first.Severity.P2 != 0 {
+		t.Fatalf("route 11 severity = %+v, want P0=2", first.Severity)
+	}
+	if first.Attempts != 3 || first.FailedAttempts != 2 {
+		t.Fatalf("route 11 attempts = %d/%d, want 3/2", first.Attempts, first.FailedAttempts)
+	}
+	if math.Abs(first.FailoverRate-2.0/3.0) > 1e-9 {
+		t.Fatalf("route 11 failover rate = %v, want 2/3", first.FailoverRate)
+	}
+	// 路由 11 失败所在的链最深顺延 2 次（sc-2）
+	if first.MaxFailoverDepth != 2 {
+		t.Fatalf("route 11 max failover depth = %d, want 2", first.MaxFailoverDepth)
+	}
+	// 身份：来源取渠道名，源分组取日志快照，而不是密钥名
+	if first.SourceName != "渠道七" || first.SourceGroupName != "源组A" {
+		t.Fatalf("route 11 identity = %q / %q, want 渠道七 / 源组A", first.SourceName, first.SourceGroupName)
+	}
+	if first.KeyName != "uops-key-a" {
+		t.Fatalf("route 11 key name = %q, want uops-key-a", first.KeyName)
+	}
+	if !first.Alive || !first.Enabled {
+		t.Fatalf("route 11 alive/enabled = %v/%v, want true/true", first.Alive, first.Enabled)
+	}
+	if first.TopError != "余额不足" {
+		t.Fatalf("route 11 top error = %q, want 余额不足", first.TopError)
+	}
+	if first.Requests != 3 {
+		t.Fatalf("route 11 requests = %d, want 3", first.Requests)
+	}
+
+	second := got.Routes[1]
+	if second.RouteID != 12 {
+		t.Fatalf("second route = %d, want 12", second.RouteID)
+	}
+	// 502 归 P1，客户端断开归 P2
+	if second.Severity.P0 != 0 || second.Severity.P1 != 1 || second.Severity.P2 != 1 {
+		t.Fatalf("route 12 severity = %+v, want P0=0/P1=1/P2=1", second.Severity)
+	}
+	// 路由 12 已删除 → alive=false，前端不给跳转
+	if second.Alive {
+		t.Fatalf("route 12 alive = true, want false (已删除)")
+	}
+	// provider 类路由没有渠道，来源退回 provider 名
+	if second.SourceName != "供应商B" {
+		t.Fatalf("route 12 source = %q, want 供应商B", second.SourceName)
+	}
+	// TTFT P95 取该路由所有有首字耗时的尝试
+	if second.TTFTP95 < 1200 {
+		t.Fatalf("route 12 ttft p95 = %v, want >=1200", second.TTFTP95)
+	}
+	// 迷你折线固定份数
+	if len(second.Points) != dispatchScoreBuckets {
+		t.Fatalf("route 12 points = %d, want %d", len(second.Points), dispatchScoreBuckets)
+	}
+}
+
+func TestGatewayUsageDispatchScorecardRejectsBadRange(t *testing.T) {
+	db := openTestDB(t)
+	usage := NewGatewayUsageLogs(db)
+	now := time.Now().UTC()
+	if _, err := usage.DispatchScorecard(now, now); err == nil {
+		t.Fatal("zero-duration range should fail")
+	}
+	if _, err := usage.DispatchScorecard(time.Time{}, now); err == nil {
+		t.Fatal("zero from should fail")
+	}
+}
+
+func TestDispatchSeverityClassifiesByUrgency(t *testing.T) {
+	cases := []struct {
+		name string
+		log  GatewayUsageLog
+		want int
+	}{
+		{"成功不分级", GatewayUsageLog{Success: true}, -1},
+		{"401 认证失效需人工", GatewayUsageLog{ErrorType: "http", StatusCode: 401}, dispatchSeverityP0},
+		{"403 欠费需人工", GatewayUsageLog{ErrorType: "http", StatusCode: 403}, dispatchSeverityP0},
+		{"404 映射配错需人工", GatewayUsageLog{ErrorType: "http", StatusCode: 404}, dispatchSeverityP0},
+		{"配置错误需人工", GatewayUsageLog{ErrorType: "config", StatusCode: 0}, dispatchSeverityP0},
+		{"429 限流算抖动", GatewayUsageLog{ErrorType: "http", StatusCode: 429}, dispatchSeverityP1},
+		{"502 算抖动", GatewayUsageLog{ErrorType: "http", StatusCode: 502}, dispatchSeverityP1},
+		{"传输超时算抖动", GatewayUsageLog{ErrorType: "transport", StatusCode: 0}, dispatchSeverityP1},
+		{"客户端断开是噪声", GatewayUsageLog{ErrorType: "client", StatusCode: 0}, dispatchSeverityP2},
+		{"499 是噪声", GatewayUsageLog{ErrorType: "", StatusCode: 499}, dispatchSeverityP2},
+	}
+	for _, tc := range cases {
+		if got := dispatchSeverityOf(tc.log); got != tc.want {
+			t.Errorf("%s: severity = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestDispatchRouteHealthUsesP0RateNotPresence(t *testing.T) {
+	sev := func(p0, p1, p2 int) GatewayDispatchSeverityCounts {
+		return GatewayDispatchSeverityCounts{P0: p0, P1: p1, P2: p2}
+	}
+	cases := []struct {
+		name  string
+		route GatewayDispatchScoreRoute
+		want  string
+	}{
+		// 370 次尝试里 1 次 P0（0.27%）：值得看一眼，但不该跟大面积 P0 同级
+		{"偶发 P0 只算关注", GatewayDispatchScoreRoute{Attempts: 370, Severity: sev(1, 0, 0)}, "watch"},
+		// 370 次里 6 次 P0（1.6%）：够格了
+		{"P0 占比过线算需处理", GatewayDispatchScoreRoute{Attempts: 370, Severity: sev(6, 0, 0)}, "action"},
+		{"顺延率过半算需处理", GatewayDispatchScoreRoute{Attempts: 100, FailoverRate: 0.5}, "action"},
+		{"顺延率双位数算关注", GatewayDispatchScoreRoute{Attempts: 100, FailoverRate: 0.1}, "watch"},
+		{"首字过慢算关注", GatewayDispatchScoreRoute{Attempts: 100, TTFTP95: 10_001}, "watch"},
+		{"干净路由是健康", GatewayDispatchScoreRoute{Attempts: 100, FailoverRate: 0.05, TTFTP95: 900}, "ok"},
+		// P1/P2 再多也不该把整体健康的路由标红，否则标记会失去意义
+		{"只有抖动和噪声不升级", GatewayDispatchScoreRoute{Attempts: 100, Severity: sev(0, 40, 40)}, "ok"},
+		{"零尝试不该除零", GatewayDispatchScoreRoute{Attempts: 0, Severity: sev(0, 0, 0)}, "ok"},
+	}
+	for _, tc := range cases {
+		if got := dispatchRouteHealth(tc.route); got != tc.want {
+			t.Errorf("%s: health = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

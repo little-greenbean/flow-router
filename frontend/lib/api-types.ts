@@ -960,8 +960,65 @@ export interface GatewayDispatchErrorCategory {
   codes: GatewayDispatchErrorCode[]
 }
 
+/**
+ * 错误按「要不要人工介入」分级，不是按 HTTP 状态码也不是按用户影响面：
+ * P0 需人工处理（认证失效 / 欠费 / 分组被删 / 配置写错，放着永远不会自愈）
+ * P1 上游抖动（5xx / 429 / 超时 / 传输错，可能自愈但要盯着）
+ * P2 噪声（客户端主动断开或取消，通常不用管）
+ */
+export interface GatewayDispatchSeverityCounts {
+  p0: number
+  p1: number
+  p2: number
+}
+
+export type DispatchHealth = "action" | "watch" | "ok"
+
+export interface GatewayDispatchScorePoint {
+  timestamp: string
+  failover_rate: number
+  ttft_p95: number
+  attempts: number
+}
+
+/** 路由健康记分卡的一行：回答「这条路由该不该禁掉」。 */
+export interface GatewayDispatchScoreRoute {
+  route_id: number
+  gateway_group_id: number
+  gateway_group_name: string
+  /** 来源：渠道名，或 provider 路由的 provider 名 */
+  source_name?: string
+  /** 源分组 */
+  source_group_name?: string
+  /** 密钥名，仅在来源和源分组都为空时兜底显示 */
+  key_name?: string
+  /** false = 路由已被删除，只剩历史日志，不提供跳转 */
+  alive: boolean
+  enabled: boolean
+  requests: number
+  attempts: number
+  failed_attempts: number
+  failover_rate: number
+  /** 该路由失败所在的请求链里，顺延次数最多的那条链顺延了几次 */
+  max_failover_depth: number
+  ttft_p95: number
+  severity: GatewayDispatchSeverityCounts
+  top_error?: string
+  /** 健康档位由后端判定（见 dispatchRouteHealth），排序也按它，两者永远一致 */
+  health: DispatchHealth
+  points: GatewayDispatchScorePoint[]
+}
+
+export interface GatewayDispatchScorecard {
+  from: string
+  to: string
+  routes: GatewayDispatchScoreRoute[]
+}
+
 export interface GatewayDispatchErrorSample {
   message: string
+  /** 0/1/2 对应 P0/P1/P2，按处理紧急度分级 */
+  severity: number
   error_type: string
   status_code: number
   count: number
@@ -982,6 +1039,7 @@ export interface GatewayDispatchErrorScope {
   attempts: number
   failed_attempts: number
   attempt_error_rate: number
+  severity: GatewayDispatchSeverityCounts
   categories: GatewayDispatchErrorCategory[]
   samples: GatewayDispatchErrorSample[]
 }

@@ -80,3 +80,40 @@ export function isDispatchRouteNavigable(
 ): boolean {
   return route.route_available !== false
 }
+
+// ---- 路由健康记分卡 ----
+//
+// 判定阈值和身份格式化放在这里而不是组件里，因为它们编码的是「什么算该禁掉」这个
+// 业务判断，值得单独测。组件只负责画。
+
+/**
+ * 单元格染色用的阈值提示，镜像后端 dispatchActionFailover / dispatchWatchFailover /
+ * dispatchWatchTTFTMillis。**判定本身在后端**（route.health），这里只决定某个数字
+ * 要不要标红——这样"排在前面"和"标成需处理"不会打架。
+ */
+export const NEEDS_ACTION_FAILOVER = 0.5
+export const WATCH_FAILOVER = 0.1
+export const WATCH_TTFT_MS = 10_000
+
+/**
+ * 路由身份 = 来源 · 源分组。
+ *
+ * 注意跟上面老的 formatDispatchRouteSource 的区别：那个把密钥名排在最前，
+ * 而密钥名（uops-ch9-sgn-GPT-Pro-927b 这种）对人没有意义。这里只在来源和
+ * 源分组双双缺失时才退回密钥名。
+ */
+export function formatScoreRouteIdentity(
+  route: { source_name?: string; source_group_name?: string; key_name?: string; route_id: number },
+): string {
+  const parts = [route.source_name, route.source_group_name]
+    .map((value) => value?.trim())
+    .filter((value): value is string => Boolean(value))
+  if (parts.length > 0) return parts.join(" · ")
+  return route.key_name?.trim() || `路由 #${route.route_id}`
+}
+
+/** TTFT 展示：秒级用 s，毫秒级用 ms，没有样本用破折号（0 会被误读成"很快"）。 */
+export function formatTTFT(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "—"
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`
+}

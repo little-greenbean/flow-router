@@ -65,6 +65,7 @@ func registerGatewayAdmin(g *gin.RouterGroup, d *Deps) {
 		gp.GET("/dispatch/stats", func(c *gin.Context) { statsGatewayDispatch(c, d) })
 		gp.GET("/dispatch/trends", func(c *gin.Context) { trendsGatewayDispatch(c, d) })
 		gp.GET("/dispatch/errors", func(c *gin.Context) { errorsGatewayDispatch(c, d) })
+		gp.GET("/dispatch/scorecard", func(c *gin.Context) { scorecardGatewayDispatch(c, d) })
 		gp.GET("/usage", func(c *gin.Context) { listGatewayUsage(c, d) })
 		gp.GET("/usage/stats", func(c *gin.Context) { statsGatewayUsage(c, d) })
 		gp.GET("/usage/models", func(c *gin.Context) { listGatewayUsageModels(c, d) })
@@ -201,6 +202,41 @@ func errorsGatewayDispatch(c *gin.Context, d *Deps) {
 		return
 	}
 	c.JSON(http.StatusOK, errors)
+}
+
+func scorecardGatewayDispatch(c *gin.Context, d *Deps) {
+	if d.GatewayUsage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage storage unavailable"})
+		return
+	}
+	to := time.Now().UTC()
+	from := to.Add(-6 * time.Hour)
+	if raw := strings.TrimSpace(c.Query("from")); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid from"})
+			return
+		}
+		from = parsed
+	}
+	if raw := strings.TrimSpace(c.Query("to")); raw != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid to"})
+			return
+		}
+		to = parsed
+	}
+	if !to.After(from) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid scorecard range"})
+		return
+	}
+	scorecard, err := d.GatewayUsage.DispatchScorecard(from, to)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, scorecard)
 }
 
 func listGatewayProviders(c *gin.Context, d *Deps) {
