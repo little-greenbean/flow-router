@@ -19,7 +19,7 @@ import { cn } from "@/lib/utils"
 
 const DIALOG_SIZE = 20
 
-export function MultiplierChanges() {
+export function MultiplierChanges({ bare = false, title }: { bare?: boolean; title?: string } = {}) {
   const summary = useDashboardSummary()
   const channels = useChannels()
   const [detailOpen, setDetailOpen] = useState(false)
@@ -81,8 +81,34 @@ export function MultiplierChanges() {
     setDetailOpen(true)
   }
 
+  const list = summary.loading ? (
+    <p className={cn("text-xs text-muted-foreground", bare ? "px-1 py-3" : "px-6 py-6")}>{"加载中…"}</p>
+  ) : items.length === 0 ? (
+    <p className={cn("text-xs text-muted-foreground", bare ? "px-1 py-3" : "px-6 py-6")}>{"暂无倍率变动记录"}</p>
+  ) : (
+    <ScrollArea type="hover" className={bare ? "h-full" : "max-h-80 lg:h-full lg:max-h-none"}>
+      <ul className="divide-y divide-border">
+        {items.map((item) => (
+          <MultiplierChangeRow key={item.id} item={item} channelMap={channelMap} compact={bare} />
+        ))}
+      </ul>
+    </ScrollArea>
+  )
+
   return (
     <>
+      {bare ? (
+        <div className="flex h-full min-h-0 flex-col">
+          <div className="mb-1.5 flex h-6 shrink-0 items-center justify-between">
+            <h3 className="text-xs font-semibold">{title ?? "最近倍率变动"}</h3>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] text-muted-foreground">{items.length > 0 ? `${items.length} 条` : ""}</span>
+              <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[10px]" onClick={openDetail}>{"查看更多"}</Button>
+            </div>
+          </div>
+          <div className="min-h-0 flex-1 overflow-hidden rounded-md border border-border/70 bg-muted/20">{list}</div>
+        </div>
+      ) : (
       <Card className="min-h-0 overflow-hidden border border-border py-4 shadow-none lg:h-100 sm:py-6">
         <CardHeader className="flex shrink-0 flex-row items-center justify-between px-4 pb-2 sm:px-6">
           <CardTitle className="text-base font-semibold">{"最近倍率变动"}</CardTitle>
@@ -93,22 +119,9 @@ export function MultiplierChanges() {
             </Button>
           </div>
         </CardHeader>
-        <CardContent className="min-h-0 flex-1 px-0">
-          {summary.loading ? (
-            <p className="px-6 py-6 text-xs text-muted-foreground">{"加载中…"}</p>
-          ) : items.length === 0 ? (
-            <p className="px-6 py-6 text-xs text-muted-foreground">{"暂无倍率变动记录"}</p>
-          ) : (
-            <ScrollArea type="hover" className="max-h-80 lg:h-full lg:max-h-none">
-              <ul className="divide-y divide-border">
-                {items.map((item) => (
-                  <MultiplierChangeRow key={item.id} item={item} channelMap={channelMap} />
-                ))}
-              </ul>
-            </ScrollArea>
-          )}
-        </CardContent>
+        <CardContent className="min-h-0 flex-1 px-0">{list}</CardContent>
       </Card>
+      )}
 
       <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
         <DialogContent className="max-h-[85vh] overflow-hidden sm:max-w-3xl">

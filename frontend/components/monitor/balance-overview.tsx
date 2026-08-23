@@ -65,7 +65,7 @@ function ChartTooltip({ active, payload, label }: { active?: boolean; payload?: 
   )
 }
 
-export function BalanceOverview() {
+export function BalanceOverview({ bare = false }: { bare?: boolean } = {}) {
   const isMobile = useIsMobile()
   const trend = useBalanceTrend(7)
   const costTrend = useCostTrend(7)
@@ -107,14 +107,9 @@ export function BalanceOverview() {
   const dot = isMobile ? false : { r: 4, fill: "var(--background)", strokeWidth: 2 }
   const activeDot = isMobile ? { r: 4, strokeWidth: 0 } : { r: 5, strokeWidth: 0 }
 
-  return (
-    <Card className="border border-border py-4 shadow-none lg:h-100 sm:py-6">
-      <CardHeader className="flex shrink-0 flex-row items-center justify-between px-4 pb-2 sm:px-6">
-        <CardTitle className="text-base font-semibold">{"余额概览"}</CardTitle>
-        <span className="text-xs text-muted-foreground">{"最近 7 天"}</span>
-      </CardHeader>
-      <CardContent className="flex min-h-0 flex-1 flex-col px-4 sm:px-6">
-        <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+  const body = (
+    <>
+        <div className={cn("flex flex-wrap items-center gap-x-4 gap-y-1 text-xs", bare ? "mb-1.5" : "mb-3")}>
           <span className="inline-flex items-center gap-1.5">
             <span className="size-2 rounded-full bg-brand" />
             <span className="text-muted-foreground">{"余额"}</span>
@@ -126,7 +121,7 @@ export function BalanceOverview() {
             </span>
           </span>
         </div>
-        <div className="h-64 min-h-0 w-full sm:h-72 lg:h-auto lg:flex-1">
+        <div className={cn("min-h-0 w-full", bare ? "flex-1" : "h-64 sm:h-72 lg:h-auto lg:flex-1")}>
           {isLoading ? (
             <div className="flex h-full items-center justify-center text-xs text-muted-foreground">{"加载中…"}</div>
           ) : data.length === 0 ? (
@@ -190,7 +185,7 @@ export function BalanceOverview() {
 
         {/* per-channel chips */}
         {channels.length > 0 ? (
-          <div className="mt-3 flex shrink-0 flex-wrap items-center gap-x-5 gap-y-2 border-t border-border pt-3">
+          <div className={cn("flex shrink-0 flex-wrap items-center gap-x-5 gap-y-2 border-t border-border", bare ? "mt-1.5 max-h-12 overflow-y-auto pt-1.5" : "mt-3 pt-3")}>
             {channels.map((c) => {
               const isFailed = !!c.last_error
               const isUnknown = c.last_balance == null
@@ -213,7 +208,18 @@ export function BalanceOverview() {
             })}
           </div>
         ) : null}
-      </CardContent>
+    </>
+  )
+
+  if (bare) return <div className="flex h-full min-h-0 flex-col">{body}</div>
+
+  return (
+    <Card className="border border-border py-4 shadow-none lg:h-100 sm:py-6">
+      <CardHeader className="flex shrink-0 flex-row items-center justify-between px-4 pb-2 sm:px-6">
+        <CardTitle className="text-base font-semibold">{"余额概览"}</CardTitle>
+        <span className="text-xs text-muted-foreground">{"最近 7 天"}</span>
+      </CardHeader>
+      <CardContent className="flex min-h-0 flex-1 flex-col px-4 sm:px-6">{body}</CardContent>
     </Card>
   )
 }
