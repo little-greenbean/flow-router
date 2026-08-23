@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"math"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -1245,3 +1246,87 @@ func TestGatewayUsageDispatchTrendsAggregatesRequestChains(t *testing.T) {
 }
 
 func ptrInt64(v int64) *int64 { return &v }
+
+func TestGatewayUsageDispatchErrorsBreaksDownFailures(t *testing.T) {
+	db := openTestDB(t)
+	usage := NewGatewayUsageLogs(db)
+	if err := db.Create(&GatewayGroup{ID: 21, Name: "错误网关"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+	to := from.Add(10 * time.Minute)
+	rows := []GatewayUsageLog{
+		// err-1：先 429 失败，再顺延成功 → 最终成功，但计入一次失败尝试
+		{GatewayGroupID: 21, RouteID: 1, RequestID: "err-1", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 429, ErrorMessage: "rate limited", CreatedAt: from.Add(10 * time.Second)},
+		{GatewayGroupID: 21, RouteID: 2, RequestID: "err-1", Attempt: 2, AttemptKind: "failover", Success: true, CreatedAt: from.Add(11 * time.Second)},
+		// err-2：两次都失败 → 最终失败
+		{GatewayGroupID: 21, RouteID: 1, RequestID: "err-2", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 429, ErrorMessage: "rate limited", CreatedAt: from.Add(1 * time.Minute)},
+		{GatewayGroupID: 21, RouteID: 2, RequestID: "err-2", Attempt: 2, AttemptKind: "failover", Success: false, ErrorType: "transport", StatusCode: 0, ErrorMessage: "dial timeout", CreatedAt: from.Add(61 * time.Second)},
+		// err-3：纯成功
+		{GatewayGroupID: 21, RouteID: 1, RequestID: "err-3", Attempt: 1, Success: true, CreatedAt: from.Add(2 * time.Minute)},
+		// err-4：一次 500 失败
+		{GatewayGroupID: 21, RouteID: 1, RequestID: "err-4", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 500, ErrorMessage: "upstream boom", CreatedAt: from.Add(3 * time.Minute)},
+	}
+	for i := range rows {
+		if err := usage.Create(&rows[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := usage.DispatchErrors(from, to)
+	if err != nil {
+		t.Fatalf("dispatch errors: %v", err)
+	}
+	if got.Requests != 4 {
+		t.Fatalf("requests = %d, want 4", got.Requests)
+	}
+	if got.FinalFailed != 2 {
+		t.Fatalf("final failed = %d, want 2 (err-2, err-4)", got.FinalFailed)
+	}
+	if got.RecoveredRequests != 1 {
+		t.Fatalf("recovered = %d, want 1 (err-1)", got.RecoveredRequests)
+	}
+	if got.Attempts != 6 {
+		t.Fatalf("attempts = %d, want 6", got.Attempts)
+	}
+	if got.FailedAttempts != 4 {
+		t.Fatalf("failed attempts = %d, want 4", got.FailedAttempts)
+	}
+	if math.Abs(got.ErrorRate-0.5) > 1e-9 {
+		t.Fatalf("error rate = %v, want 0.5", got.ErrorRate)
+	}
+	// 分类按失败尝试数降序：http 3 条（429×2 + 500×1），transport 1 条
+	if len(got.Categories) != 2 {
+		t.Fatalf("categories = %d, want 2", len(got.Categories))
+	}
+	if got.Categories[0].ErrorType != "http" || got.Categories[0].Count != 3 {
+		t.Fatalf("first category = %+v, want http/3", got.Categories[0])
+	}
+	if got.Categories[0].Label != "上游 HTTP 错误" {
+		t.Fatalf("http label = %q", got.Categories[0].Label)
+	}
+	if len(got.Categories[0].Codes) != 2 || got.Categories[0].Codes[0].StatusCode != 429 || got.Categories[0].Codes[0].Count != 2 {
+		t.Fatalf("http codes = %+v, want 429×2 first", got.Categories[0].Codes)
+	}
+	if got.Categories[1].ErrorType != "transport" || got.Categories[1].Codes[0].Label != "无响应" {
+		t.Fatalf("transport category = %+v", got.Categories[1])
+	}
+	// 相同 message 合并计数，按次数降序
+	if len(got.Samples) == 0 || got.Samples[0].Message != "rate limited" || got.Samples[0].Count != 2 {
+		t.Fatalf("top sample = %+v, want rate limited ×2", got.Samples)
+	}
+	if len(got.Groups) != 1 || got.Groups[0].GatewayGroupName != "错误网关" || got.Groups[0].FinalFailed != 2 {
+		t.Fatalf("groups = %+v", got.Groups)
+	}
+}
+
+func TestGatewayUsageDispatchErrorsRejectsBadRange(t *testing.T) {
+	usage := NewGatewayUsageLogs(openTestDB(t))
+	at := time.Date(2026, 8, 22, 10, 0, 0, 0, time.UTC)
+	if _, err := usage.DispatchErrors(at, at); err == nil {
+		t.Fatal("expected error for non-advancing range")
+	}
+	if _, err := usage.DispatchErrors(time.Time{}, at); err == nil {
+		t.Fatal("expected error for zero from")
+	}
+}

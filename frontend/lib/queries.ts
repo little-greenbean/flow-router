@@ -12,6 +12,7 @@ import type {
   CostTrendPoint,
   DashboardSummary,
   GatewayDispatchStats,
+  GatewayDispatchErrors,
   GatewayDispatchTrends,
   GatewayDispatchWindow,
   GatewayUsageStats,
@@ -160,6 +161,14 @@ export function useGatewayDispatchTrends(from?: string, to?: string, bucket = "5
   if (from) qs.set("from", from)
   if (to) qs.set("to", to)
   return useApi<GatewayDispatchTrends>(`/gateway/dispatch/trends?${qs}`)
+}
+
+export function useGatewayDispatchErrors(from?: string, to?: string) {
+  const qs = new URLSearchParams()
+  if (from) qs.set("from", from)
+  if (to) qs.set("to", to)
+  const suffix = qs.toString()
+  return useApi<GatewayDispatchErrors>(`/gateway/dispatch/errors${suffix ? `?${suffix}` : ""}`)
 }
 
 export function useAppVersion() {

@@ -947,6 +947,48 @@ export interface GatewayDispatchTrendGroup {
   routes: GatewayDispatchTrendRoute[]
 }
 
+export interface GatewayDispatchErrorCode {
+  status_code: number
+  label: string
+  count: number
+}
+
+export interface GatewayDispatchErrorCategory {
+  error_type: string
+  label: string
+  count: number
+  codes: GatewayDispatchErrorCode[]
+}
+
+export interface GatewayDispatchErrorSample {
+  message: string
+  error_type: string
+  status_code: number
+  count: number
+  last_seen: string
+}
+
+export interface GatewayDispatchErrorGroup {
+  gateway_group_id: number
+  gateway_group_name: string
+  requests: number
+  final_failed: number
+}
+
+export interface GatewayDispatchErrors {
+  from: string
+  to: string
+  requests: number
+  final_failed: number
+  error_rate: number
+  attempts: number
+  failed_attempts: number
+  recovered_requests: number
+  categories: GatewayDispatchErrorCategory[]
+  samples: GatewayDispatchErrorSample[]
+  groups: GatewayDispatchErrorGroup[]
+}
+
 export interface GatewayDispatchTrends {
   from: string
   to: string

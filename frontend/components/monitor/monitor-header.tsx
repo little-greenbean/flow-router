@@ -218,7 +218,7 @@ export function MonitorHeader() {
               <DropdownMenuSeparator />
               <DropdownMenuItem asChild>
                 <a
-                  href="https://github.com/bejix/upstream-ops"
+                  href="https://github.com/little-greenbean/flow-router"
                   target="_blank"
                   rel="noopener noreferrer"
                 >
@@ -305,7 +305,7 @@ export function MonitorHeader() {
                   aria-label="GitHub 仓库"
                 >
                   <a
-                    href="https://github.com/bejix/upstream-ops"
+                    href="https://github.com/little-greenbean/flow-router"
                     target="_blank"
                     rel="noopener noreferrer"
                   >
@@ -314,7 +314,7 @@ export function MonitorHeader() {
                 </Button>
               </TooltipTrigger>
               <TooltipContent side="bottom" className="text-xs">
-                {"GitHub · bejix/upstream-ops"}
+                {"GitHub · little-greenbean/flow-router"}
               </TooltipContent>
             </Tooltip>
 
