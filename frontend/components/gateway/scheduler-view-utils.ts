@@ -94,7 +94,7 @@ function routeState(
 
 /**
  * Mirrors the runtime's hard eligibility gate and rate ordering for a read-only UI.
- * `configuredShare` is intentionally labeled as a preview: current UpstreamOps uses
+ * `configuredShare` is intentionally labeled as a preview: current Flow-Router uses
  * weight as a sort tie-breaker, not as proportional traffic splitting.
  */
 export function deriveSchedulerSnapshot(

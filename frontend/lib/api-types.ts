@@ -1,5 +1,5 @@
 /**
- * API response shapes for UpstreamOps backend.
+ * API response shapes for the Flow-Router backend.
  * Keep in sync with backend/storage/*.go and backend/api/*.go.
  */
 

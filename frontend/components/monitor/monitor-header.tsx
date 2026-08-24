@@ -47,7 +47,7 @@ export function MonitorHeader() {
   const [syncing, setSyncing] = useState(false)
   const [checkingVersion, setCheckingVersion] = useState(false)
 
-  const appTitle = appVersion.data?.title?.trim() || "UpstreamOps"
+  const appTitle = appVersion.data?.title?.trim() || "Flow-Router"
   const version = appVersion.data?.version?.trim()
   const latestVersion = appVersion.data?.latest_version?.trim()
   const updateAvailable = Boolean(appVersion.data?.update_available && latestVersion)

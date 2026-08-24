@@ -68,3 +68,6 @@ cmd/seed-demo/
 frontend/tsconfig.tsbuildinfo
 
 docs/md
+
+# 本地 agent 工具目录，不属于产品代码
+.superpowers/

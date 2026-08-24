@@ -440,7 +440,7 @@ func configSearchPaths() []string {
 }
 
 func setDefaults(v *viper.Viper) {
-	v.SetDefault("app.title", "UpstreamOps")
+	v.SetDefault("app.title", "Flow-Router")
 	v.SetDefault("app.notificationPrefix", "[AI 聚合监控] ")
 
 	v.SetDefault("server.port", 8418)

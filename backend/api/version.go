@@ -17,7 +17,10 @@ import (
 )
 
 const (
-	githubRepoURL              = "https://github.com/bejix/upstream-ops"
+	// 本仓库（fork）。头部那个「GitHub 仓库」链接指到这里。
+	githubRepoURL = "https://github.com/little-greenbean/flow-router"
+	// 版本检查仍然看上游：发版发生在上游，fork 本身不打 release，
+	// 指到 fork 只会一直 404，反而丢掉「上游有新版本了」这个有用的信号。
 	defaultGitHubLatestRelease = "https://api.github.com/repos/bejix/upstream-ops/releases/latest"
 )
 
@@ -50,7 +53,7 @@ func registerVersion(api *gin.RouterGroup, d *Deps) {
 }
 
 func buildVersionResponse(ctx context.Context, d *Deps, force bool) versionResponse {
-	app := config.AppConfig{Title: "UpstreamOps"}
+	app := config.AppConfig{Title: "Flow-Router"}
 	proxyCfg := config.ProxyConfig{}
 	if d != nil && d.Runtime != nil {
 		if cfg, err := config.LoadFile(d.Runtime.ConfigPath()); err == nil {
@@ -60,7 +63,7 @@ func buildVersionResponse(ctx context.Context, d *Deps, force bool) versionRespo
 	}
 
 	resp := versionResponse{
-		Name:    "upstream-ops",
+		Name:    "flow-router",
 		Title:   app.Title,
 		Version: global.VERSION,
 		RepoURL: githubRepoURL,
@@ -106,7 +109,7 @@ func fetchLatestGitHubRelease(ctx context.Context, client *http.Client) (string,
 		return "", "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "upstream-ops")
+	req.Header.Set("User-Agent", "flow-router")
 
 	resp, err := client.Do(req)
 	if err != nil {

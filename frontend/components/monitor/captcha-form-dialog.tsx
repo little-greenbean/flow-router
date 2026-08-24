@@ -120,7 +120,7 @@ export function CaptchaFormDialog({ open, onOpenChange, config }: CaptchaFormDia
         <DialogHeader>
           <DialogTitle>{isEdit ? "编辑打码平台" : "新增打码平台"}</DialogTitle>
           <DialogDescription>
-            上游站点开启 Turnstile 时，会用此打码 provider 拿 token。siteKey 由 UpstreamOps 自动从上游公开接口拉，无需手填。
+            上游站点开启 Turnstile 时，会用此打码 provider 拿 token。siteKey 由 Flow-Router 自动从上游公开接口拉，无需手填。
           </DialogDescription>
         </DialogHeader>
 

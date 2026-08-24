@@ -10,14 +10,73 @@ It also includes an OpenAI / Claude / Responses compatible request gateway: crea
 
 ## Flow Router Updates
 
-This fork currently focuses on two practical improvements:
+This fork focuses on one thing: **making dispatch legible**. With multiple gateway groups,
+multiple routes and failover in play, the hard question is never "what's the failure rate" —
+it's "which path did this request actually take, where did it fail over, and where did it land".
 
-- **Latest model compatibility:** the gateway group model page can pull a Sub2API-compatible public model catalog and bind newly listed models to selected NewAPI or Sub2API routes, reducing missing-model issues in the local selector. This declaration does not replace an upstream availability probe.
-- **Dispatch visibility:** the home dashboard shows per-gateway-group route calls, failure rates, average first-token latency, selectable time windows, cost-ordered routes, and clickable links to the matching channel route.
+### Request flow as a Sankey diagram
+
+The home dashboard renders dispatch as a request-flow diagram. By default it splits by gateway
+group: all requests on the left, gateway groups in the middle, and three outcomes on the right —
+**first try / recovered after failover / final failure**. Link thickness is the number of requests
+that actually took that path; red links are "failed here and moved on".
+
+![Dispatch flow overview](docs/images/dispatch-overview.png)
+
+Click a gateway tag to switch, and the drill-down lays out **which route each hop landed on**.
+Hop 1 is the group's first-choice route; every column to the right is one failover:
+
+![Per-gateway hop breakdown](docs/images/dispatch-drill.png)
+
+Every node is an action: click a route to open its config, click an outcome to jump to usage
+records pre-filtered accordingly. Even hairline links are clickable — clicking a link acts on
+the node it flows into.
+
+### Highlight whole chains by failover count
+
+Inside a gateway view, buttons appear for each **failover count** present in the data, annotated
+with how many request chains fall in that bucket. Clicking one refetches nothing and re-renders
+nothing — it just brightens the **complete path** those requests took from gateway entry to
+outcome, and dims everything else:
+
+![Highlight complete chains by failover count](docs/images/dispatch-failover-highlight.png)
+
+"Failover count" means how many times **one request from start to finish** failed over — not a
+single hop fragment — so the highlight covers the whole path with no gaps in the middle. Note
+that link width always means "total requests on this edge"; highlighting changes opacity, not
+width (changing width would require a re-layout, i.e. a different diagram), which is why the
+buttons carry the real chain count.
+
+### Hover explains, it never redraws
+
+Hovering only shows a tooltip; it never lights up other chains. A node in a Sankey belongs to
+many chains at once, so "the chain I'm hovering" has no unique answer — letting hover guess just
+highlights a pile of unrelated chains and clobbers whatever you clicked.
+
+![Tooltip on a single segment](docs/images/dispatch-tooltip.png)
+
+The chart follows the light/dark theme and switches instantly:
+
+![Dark theme](docs/images/dispatch-dark.png)
+
+### Route probes now stream
+
+Model probes used to send a non-streaming request and wait for the entire response. Relays —
+especially cached Claude routes — return the first token in 2-3 seconds but often need tens of
+seconds, sometimes minutes, to finish. A batch of **perfectly usable** routes was therefore
+reported as `context deadline exceeded`, indistinguishable from genuinely dead ones.
+
+Probes now stream and count a route as reachable once the first byte arrives, matching how
+clients actually use it. The first-token budget follows the gateway group's
+`first_token_timeout_sec`, falling back to a default. The reported latency is labelled
+accordingly as first-token latency.
 
 ### TODO: AI-assisted scheduling
 
-The current scheduler remains deterministic and rule-based. A future version will introduce AI as a decision layer that evaluates route health, latency, failure rate, and cost, then adjusts route weights. The existing rules and failover path will remain the baseline and fallback so that AI decisions do not become a single point of failure.
+The scheduler remains deterministic and rule-based. A future version will introduce AI as a
+decision layer that evaluates route health, latency, failure rate and cost, then adjusts route
+weights. The existing rules and failover path stay as the baseline and fallback so AI decisions
+do not become a single point of failure.
 
 ## Sponsor
 
@@ -45,22 +104,6 @@ Flow Router focuses on these problems:
 - Historical tracking: rate changes, balance snapshots, notification logs, and upstream announcements are stored locally.
 - Easier operations: API key management, recharge, redeem, subscription purchase, and renewal are available from one entry point.
 - Complex network support: global proxy support with per-upstream, per-notification-channel, and per-captcha-provider proxy switches.
-
-## Preview
-
-![UpstreamOps preview 1](docs/images/demo1.png)
-
-![UpstreamOps preview 2](docs/images/demo2.png)
-
-![UpstreamOps preview 3](docs/images/demo3.png)
-
-![UpstreamOps preview 4](docs/images/demo4.png)
-
-![UpstreamOps preview 5](docs/images/demo5.png)
-
-![UpstreamOps preview 6](docs/images/demo6.png)
-
-![UpstreamOps preview 7](docs/images/demo7.png)
 
 ## Features
 
@@ -137,7 +180,7 @@ Flow Router focuses on these problems:
 
 ### Subscription Management and Usage Monitoring
 
-For Sub2API upstream channels, UpstreamOps provides subscription lifecycle management and usage monitoring:
+For Sub2API upstream channels, Flow Router provides subscription lifecycle management and usage monitoring:
 
 - Queries upstream subscription plans and payment methods.
 - Purchases or renews subscriptions.
@@ -490,7 +533,7 @@ Username/password mode:
 - If the login endpoint requires extra fields, provide a JSON object in extra form parameters.
 - If Turnstile is enabled, configure a captcha provider first, then enable Turnstile in the channel.
 
-Newer NewAPI builds (QuantumNous/new-api and forks) issue short-lived `access_token` Bearer JWTs (default 15 minutes) at login and return a `new_api_refresh` refresh token. UpstreamOps automatically calls `/api/user/auth/refresh` to renew the access token and rotate the refresh token before it expires, so frequent re-login is not needed. Older NewAPI builds still authenticate via `Set-Cookie: session=...` plus the `New-Api-User` header; the connector auto-detects and supports both.
+Newer NewAPI builds (QuantumNous/new-api and forks) issue short-lived `access_token` Bearer JWTs (default 15 minutes) at login and return a `new_api_refresh` refresh token. Flow Router automatically calls `/api/user/auth/refresh` to renew the access token and rotate the refresh token before it expires, so frequent re-login is not needed. Older NewAPI builds still authenticate via `Set-Cookie: session=...` plus the `New-Api-User` header; the connector auto-detects and supports both.
 
 Token/cookie mode:
 
@@ -566,7 +609,7 @@ Webhook body example:
 ```json
 {
   "event": "announcement",
-  "subject": "[UpstreamOps] xxx",
+  "subject": "[AI 聚合监控] xxx",
   "body": "notification body",
   "extra": {}
 }
