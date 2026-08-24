@@ -65,7 +65,8 @@ func registerGatewayAdmin(g *gin.RouterGroup, d *Deps) {
 		gp.GET("/dispatch/stats", func(c *gin.Context) { statsGatewayDispatch(c, d) })
 		gp.GET("/dispatch/trends", func(c *gin.Context) { trendsGatewayDispatch(c, d) })
 		gp.GET("/dispatch/errors", func(c *gin.Context) { errorsGatewayDispatch(c, d) })
-		gp.GET("/dispatch/attention", func(c *gin.Context) { attentionGatewayDispatch(c, d) })
+		gp.GET("/dispatch/flow", func(c *gin.Context) { flowGatewayDispatch(c, d) })
+		gp.GET("/dispatch/errors/raw", func(c *gin.Context) { rawErrorsGatewayDispatch(c, d) })
 		gp.GET("/usage", func(c *gin.Context) { listGatewayUsage(c, d) })
 		gp.GET("/usage/stats", func(c *gin.Context) { statsGatewayUsage(c, d) })
 		gp.GET("/usage/models", func(c *gin.Context) { listGatewayUsageModels(c, d) })
@@ -204,18 +205,15 @@ func errorsGatewayDispatch(c *gin.Context, d *Deps) {
 	c.JSON(http.StatusOK, errors)
 }
 
-func attentionGatewayDispatch(c *gin.Context, d *Deps) {
-	if d.GatewayUsage == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage storage unavailable"})
-		return
-	}
+// dispatchRange 解析所有调度接口共用的 from/to（RFC3339Nano），默认最近一小时。
+func dispatchRange(c *gin.Context) (time.Time, time.Time, bool) {
 	to := time.Now().UTC()
 	from := to.Add(-time.Hour)
 	if raw := strings.TrimSpace(c.Query("from")); raw != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid from"})
-			return
+			return time.Time{}, time.Time{}, false
 		}
 		from = parsed
 	}
@@ -223,20 +221,54 @@ func attentionGatewayDispatch(c *gin.Context, d *Deps) {
 		parsed, err := time.Parse(time.RFC3339Nano, raw)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid to"})
-			return
+			return time.Time{}, time.Time{}, false
 		}
 		to = parsed
 	}
 	if !to.After(from) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid attention range"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid dispatch range"})
+		return time.Time{}, time.Time{}, false
+	}
+	return from, to, true
+}
+
+func flowGatewayDispatch(c *gin.Context, d *Deps) {
+	if d.GatewayUsage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage storage unavailable"})
 		return
 	}
-	attention, err := d.GatewayUsage.DispatchAttention(from, to)
+	from, to, ok := dispatchRange(c)
+	if !ok {
+		return
+	}
+	flow, err := d.GatewayUsage.DispatchFlow(from, to, uint(queryInt(c, "group", 0)))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, attention)
+	c.JSON(http.StatusOK, flow)
+}
+
+func rawErrorsGatewayDispatch(c *gin.Context, d *Deps) {
+	if d.GatewayUsage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage storage unavailable"})
+		return
+	}
+	from, to, ok := dispatchRange(c)
+	if !ok {
+		return
+	}
+	raw, err := d.GatewayUsage.DispatchRawErrors(
+		from, to,
+		uint(queryInt(c, "group", 0)),
+		uint(queryInt(c, "route", 0)),
+		queryInt(c, "limit", 0),
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, raw)
 }
 
 func listGatewayProviders(c *gin.Context, d *Deps) {

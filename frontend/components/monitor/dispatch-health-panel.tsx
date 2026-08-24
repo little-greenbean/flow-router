@@ -1,280 +1,226 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Link } from "react-router-dom"
-import { Activity, ChevronRight } from "lucide-react"
+import { Activity, ChevronRight, Copy, ExternalLink } from "lucide-react"
 import * as echarts from "echarts"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { useGatewayDispatchAttention, useGatewayDispatchErrors } from "@/lib/queries"
+import { useGatewayDispatchFlow, useGatewayDispatchRawErrors } from "@/lib/queries"
 import { useRefreshTick } from "@/lib/refresh-context"
 import type {
-  DispatchHealth,
-  GatewayDispatchAttempt,
-  GatewayDispatchAttentionGroup,
-  GatewayDispatchAttentionRoute,
-  GatewayDispatchErrorScope,
+  GatewayDispatchFlow,
+  GatewayDispatchFlowNode,
+  GatewayDispatchRawError,
   GatewayDispatchWindow,
 } from "@/lib/api-types"
 import {
   DISPATCH_RANGE_OPTIONS,
-  NEEDS_ACTION_FAILOVER,
-  NEEDS_ACTION_FAIL_STREAK,
-  WATCH_FAILOVER,
-  WATCH_FAIL_STREAK,
-  WATCH_TTFT_MS,
   dispatchRangeMinutes,
   dispatchRoutePath,
-  formatRouteIdentity,
-  formatTTFT,
+  flowShare,
+  formatDuration,
+  formatErrorClock,
+  formatPercent,
 } from "@/components/monitor/dispatch-health-utils"
 import { cn } from "@/lib/utils"
 
 /**
- * 调度情况面板。
+ * 调度情况面板 = 流向 + 原文。
  *
- * 组织方式跟着运维动作走：网关是操作单位（一个网关一组备选路由），所以「建议关注」
- * 先按网关折叠，展开才看是哪条路由在拖后腿，最后用「最近请求状态」把抽象的百分比
- * 落到一格一格具体的尝试上。下半部分保留错误下钻，回答「到底错在哪」。
+ * 上半部分用桑基图画请求怎么流：默认把窗口内所有请求按网关分流、再分到三种结局；
+ * 点某个网关就下钻进去，按「第几跳打在哪条路由上」逐层铺开。顺延本来就是一条链上的
+ * 流动，用桑基画比任何汇总表都直白——线有多粗就是有多少请求真的走了这条路。
+ *
+ * 下半部分是原始报错，刻意不归类、不合并、不截断：排查时要的就是上游原话。
  */
 
-const EMPTY_ERROR_SCOPE: GatewayDispatchErrorScope = {
-  requests: 0, final_failed: 0, error_rate: 0, recovered_requests: 0,
-  attempts: 0, failed_attempts: 0, attempt_error_rate: 0,
-  severity: { p0: 0, p1: 0, p2: 0 }, categories: [], samples: [],
-}
+const FLOW_COLORS = {
+  root: "#2878bd",
+  gateway: "#2878bd",
+  route: "#5a7fa6",
+  overflow: "#7b61b3",
+  direct: "#3f9d6a",
+  recovered: "#db7b2b",
+  failed: "#c45050",
+} as const
 
-const ERROR_COLORS: Record<string, string> = {
-  http: "#c45050", transport: "#db7b2b", config: "#7b61b3", internal: "#b3527d", client: "#6b7787", "": "#98a3b4",
-}
-
-// P0/P1/P2 按「要不要人工介入」分级，与后端 dispatchSeverityOf 一一对应。
-const SEVERITY_META = [
-  { key: "p0" as const, label: "P0", hint: "需人工处理：认证失效 / 欠费 / 分组被删 / 配置写错，放着不会自愈", color: "#c45050" },
-  { key: "p1" as const, label: "P1", hint: "上游抖动：5xx / 429 / 超时 / 传输错，可能自愈但要盯着", color: "#db7b2b" },
-  { key: "p2" as const, label: "P2", hint: "噪声：客户端主动断开或取消，通常不用管", color: "#98a3b4" },
-]
-
-const SUCCESS_COLOR = "#3f9d6a"
-
-const HEALTH_META: Record<DispatchHealth, { mark: string; label: string; className: string }> = {
-  action: { mark: "▲", label: "需处理", className: "text-danger" },
-  watch: { mark: "●", label: "关注", className: "text-warning" },
-  ok: { mark: "○", label: "健康", className: "text-success" },
-}
-
-const ATTEMPT_KIND_LABEL: Record<string, string> = {
-  primary: "首发", retry: "重试", failover: "顺延",
-}
-
-function severityColor(severity: number): string {
-  return SEVERITY_META[severity]?.color ?? SUCCESS_COLOR
-}
-
-function formatClock(iso: string): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return iso
-  return date.toLocaleTimeString("zh-CN", { hour12: false })
-}
-
-function attemptTitle(mark: GatewayDispatchAttempt): string {
-  const kind = ATTEMPT_KIND_LABEL[mark.attempt_kind ?? "primary"] ?? mark.attempt_kind ?? ""
-  const head = [formatClock(mark.timestamp), kind, mark.success ? "成功" : (SEVERITY_META[mark.severity]?.label ?? "失败")]
-  if (mark.status_code) head.push(String(mark.status_code))
-  const tail: string[] = []
-  if (mark.model) tail.push(mark.model)
-  if (mark.first_token_ms) tail.push(`首字 ${formatTTFT(mark.first_token_ms)}`)
-  if (mark.message) tail.push(mark.message)
-  return tail.length > 0 ? `${head.join(" · ")}\n${tail.join("\n")}` : head.join(" · ")
-}
-
-/**
- * 最近请求状态条：一格一次尝试，左旧右新。
- *
- * 这比趋势折线更适合当前这个决策——折线把「20% 失败率」摊平成一条线，看不出
- * 那 20% 是均匀散着（抖动）还是连着一片（挂了）。一格一格摆出来，连败一眼可见。
- */
-function RecentStrip({ marks }: { marks: GatewayDispatchAttempt[] }) {
-  if (marks.length === 0) {
-    return <span className="text-[10px] text-muted-foreground">窗口内无尝试</span>
+function nodeColor(node: GatewayDispatchFlowNode): string {
+  if (node.kind === "outcome") {
+    return FLOW_COLORS[(node.outcome ?? "failed") as keyof typeof FLOW_COLORS] ?? FLOW_COLORS.failed
   }
-  return (
-    <span className="inline-flex flex-wrap items-center gap-[2px]">
-      {marks.map((mark, index) => (
-        <span
-          key={`${mark.timestamp}-${index}`}
-          title={attemptTitle(mark)}
-          className="h-3.5 w-2 rounded-[1px]"
-          style={{ backgroundColor: mark.success ? SUCCESS_COLOR : severityColor(mark.severity), opacity: mark.success ? 0.55 : 1 }}
-        />
-      ))}
-    </span>
-  )
+  return FLOW_COLORS[node.kind as keyof typeof FLOW_COLORS] ?? FLOW_COLORS.route
 }
 
-function SeverityCounts({ severity, className }: { severity: { p0: number; p1: number; p2: number }; className?: string }) {
-  return (
-    <span className={cn("inline-flex items-center gap-1.5 tabular-nums", className)}>
-      {SEVERITY_META.map((item) => {
-        const value = severity[item.key]
-        return (
-          <span key={item.key} title={item.hint} className={cn(value === 0 && "text-muted-foreground/40")}
-            style={value > 0 ? { color: item.color } : undefined}>
-            {item.label} {value}
-          </span>
-        )
-      })}
-    </span>
-  )
+/** 图高按最挤的那一列算：节点多就长一点，免得标签叠成一团。 */
+function flowHeight(flow: GatewayDispatchFlow | null | undefined): number {
+  if (!flow || flow.nodes.length === 0) return 280
+  const perDepth = new Map<number, number>()
+  for (const node of flow.nodes) perDepth.set(node.depth, (perDepth.get(node.depth) ?? 0) + 1)
+  const widest = Math.max(...perDepth.values())
+  return Math.min(640, Math.max(280, widest * 34 + 60))
 }
 
-/** 展开后的一条路由：身份 + 指标 + 最近请求状态。 */
-function AttentionRoute({ route }: { route: GatewayDispatchAttentionRoute }) {
-  const meta = HEALTH_META[route.health] ?? HEALTH_META.ok
-  const identity = formatRouteIdentity(route)
-  return (
-    <div className="border-t border-border/50 px-2 py-1.5 first:border-t-0">
-      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-        <span className={cn("text-[10px]", meta.className)} title={meta.label}>{meta.mark}</span>
-        {route.alive ? (
-          // 深链接：网关页会切到对应组的路由标签、滚动定位并短暂高亮
-          <Link to={dispatchRoutePath(route.gateway_group_id, route.route_id)}
-            className="max-w-[300px] truncate text-[11px] font-medium text-brand hover:underline"
-            title={`${identity} — 点击跳转到该路由`}>
-            {identity}
-          </Link>
-        ) : (
-          <span className="max-w-[300px] truncate text-[11px] font-medium text-muted-foreground" title={`${identity}（路由已删除）`}>
-            {identity}
-          </span>
-        )}
-        <span className="text-[10px] text-muted-foreground">
-          {!route.alive ? "已删除 · " : !route.enabled ? "已禁用 · " : ""}
-          {route.attempts} 次尝试 / {route.requests} 请求
-        </span>
-      </div>
-
-      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
-        <span title="该路由失败并触发重试/顺延的尝试占比">
-          顺延率{" "}
-          <b className={cn("tabular-nums", route.failover_rate >= NEEDS_ACTION_FAILOVER ? "text-danger" : route.failover_rate >= WATCH_FAILOVER ? "text-warning" : "text-foreground")}>
-            {(route.failover_rate * 100).toFixed(1)}%
-          </b>
-        </span>
-        <span title="窗口末尾还连着败几次 / 窗口内最长的一段连败">
-          连败{" "}
-          <b className={cn("tabular-nums", route.current_fail_streak >= NEEDS_ACTION_FAIL_STREAK ? "text-danger" : route.current_fail_streak >= WATCH_FAIL_STREAK ? "text-warning" : "text-foreground")}>
-            {route.current_fail_streak}
-          </b>
-          <span className="text-muted-foreground/70"> 次（最长 {route.max_fail_streak}）</span>
-        </span>
-        <span title="该路由失败所在的请求链里，顺延次数最多的那条链顺延了几次">
-          连深 <b className={cn("tabular-nums", route.max_failover_depth >= 2 ? "text-danger" : "text-foreground")}>{route.max_failover_depth}</b>
-        </span>
-        <span title="首字节耗时 P95">
-          TTFT95 <b className={cn("tabular-nums", route.ttft_p95 > WATCH_TTFT_MS ? "text-warning" : "text-foreground")}>{formatTTFT(route.ttft_p95)}</b>
-        </span>
-        <SeverityCounts severity={route.severity} />
-      </div>
-
-      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="text-[10px] text-muted-foreground">最近</span>
-        <RecentStrip marks={route.recent} />
-        {route.top_error ? (
-          <span className="max-w-[420px] truncate text-[10px] text-muted-foreground" title={route.top_error}>{route.top_error}</span>
-        ) : null}
-      </div>
-    </div>
-  )
+function flowOption(flow: GatewayDispatchFlow) {
+  const labels = new Map(flow.nodes.map((node) => [node.id, node.label]))
+  const total = flow.requests
+  // 最后一列的标签默认画在节点右边，会被画布裁掉，翻到左边去
+  const maxDepth = flow.nodes.reduce((max, node) => Math.max(max, node.depth), 0)
+  return {
+    animationDuration: 240,
+    tooltip: {
+      trigger: "item" as const,
+      confine: true,
+      borderColor: "#dde3ea",
+      textStyle: { fontSize: 11 },
+      formatter: (params: unknown) => {
+        const item = params as {
+          dataType?: string
+          data?: Record<string, unknown>
+          value?: number
+        }
+        if (item.dataType === "edge") {
+          const data = item.data as { source: string; target: string; value: number; failed?: boolean }
+          const arrow = data.failed ? "→（失败后转走）→" : "→"
+          return `${labels.get(data.source) ?? data.source} ${arrow} ${labels.get(data.target) ?? data.target}<br/><b>${data.value}</b> 请求 · ${formatPercent(flowShare(data.value, total))}`
+        }
+        const data = item.data as { raw?: GatewayDispatchFlowNode; hint?: string }
+        const raw = data.raw
+        if (!raw) return ""
+        const value = Number(item.value ?? raw.value ?? 0)
+        const lines = [`<b>${raw.label}</b>`, `${value} 请求 · 占全部 ${formatPercent(flowShare(value, total))}`]
+        if (data.hint) lines.push(data.hint)
+        return lines.join("<br/>")
+      },
+    },
+    series: [
+      {
+        type: "sankey" as const,
+        left: 8,
+        right: 8,
+        top: 10,
+        bottom: 10,
+        nodeGap: 10,
+        nodeWidth: 12,
+        nodeAlign: "justify" as const,
+        draggable: false,
+        emphasis: { focus: "adjacency" as const },
+        // 不要把节点字段摊到 data 上：我们的 label 是字符串，ECharts 的 label 是配置对象，
+        // 摊平会互相覆盖（点一下就把 label 对象当成名字塞进 React，直接白屏）。
+        // 原始节点整个挂在 raw 上，tooltip 和 click 都从 raw 取。
+        data: flow.nodes.map((node) => ({
+          raw: node,
+          name: node.id,
+          value: node.value,
+          depth: node.depth,
+          itemStyle: { color: nodeColor(node), borderWidth: 0 },
+          label: {
+            fontSize: 10,
+            color: "#4a5462",
+            position: node.depth === maxDepth ? ("left" as const) : ("right" as const),
+            // 用 id 当 name 保证唯一（同一条路由在不同跳是不同节点），
+            // 所以标签必须自己给，不能让 ECharts 直接画 name
+            formatter: () => node.label,
+          },
+          hint: node.kind === "route"
+            ? `第 ${node.hop} 跳${node.alive === false ? " · 路由已删除" : " · 点击跳转到该路由"}`
+            : node.kind === "gateway" && flow.scope === "all"
+            ? "点击下钻到这个网关"
+            : node.kind === "overflow"
+            ? "更深的顺延都收在这里"
+            : undefined,
+        })),
+        links: flow.links.map((link) => ({
+          ...link,
+          lineStyle: {
+            color: link.failed ? FLOW_COLORS.failed : FLOW_COLORS.route,
+            opacity: link.failed ? 0.34 : 0.2,
+            curveness: 0.5,
+          },
+        })),
+      },
+    ],
+  }
 }
 
-/** 一个网关的折叠行。收起时只给「要不要展开」需要的信息。 */
-function AttentionGroup({
-  group, open, onToggle, showHealthy,
-}: {
-  group: GatewayDispatchAttentionGroup
-  open: boolean
-  onToggle: () => void
-  showHealthy: boolean
-}) {
-  const meta = HEALTH_META[group.health] ?? HEALTH_META.ok
-  const visible = showHealthy ? group.routes : group.routes.filter((route) => route.health !== "ok")
+type ErrorScope = { gatewayID: number; gatewayName: string; routeID?: number; routeLabel?: string }
+
+const RAW_LIMITS = [50, 100, 200]
+
+function RawErrorRow({ item }: { item: GatewayDispatchRawError }) {
+  const [open, setOpen] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const extras = [item.detail, item.upstream_body, item.upstream_headers].filter(Boolean)
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(item, null, 2))
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      // 剪贴板被浏览器挡了就算了，展开的原文照样能手动选
+      setCopied(false)
+    }
+  }
+
   return (
-    <div className="rounded-md border border-border/70">
-      <button type="button" onClick={onToggle} aria-expanded={open}
-        className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-2 py-1.5 text-left hover:bg-muted/30">
-        <ChevronRight className={cn("size-3 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")} />
-        <span className={cn("text-[10px]", meta.className)} title={meta.label}>{meta.mark}</span>
-        <span className="min-w-0 flex-1 truncate text-[11px] font-medium" title={group.gateway_group_name}>{group.gateway_group_name}</span>
-        <span className="text-[10px] text-muted-foreground" title="窗口内至少顺延过一次的请求占比（链级：一条请求算一次，不管跨了几条路由）">
-          顺延请求{" "}
-          <b className={cn("tabular-nums", group.request_failover_rate >= NEEDS_ACTION_FAILOVER ? "text-danger" : group.request_failover_rate >= WATCH_FAILOVER ? "text-warning" : "text-foreground")}>
-            {(group.request_failover_rate * 100).toFixed(1)}%
-          </b>
-          <span className="text-muted-foreground/70"> {group.failover_requests}/{group.requests}</span>
+    <div className="border-t border-border/60 px-2 py-1.5 first:border-t-0">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground">
+        <span className="tabular-nums text-foreground">{formatErrorClock(item.timestamp)}</span>
+        <span className={cn("rounded px-1 font-medium tabular-nums text-white",
+          item.status_code >= 500 || item.status_code === 0 ? "bg-warning" : "bg-danger")}>
+          {item.status_code > 0 ? item.status_code : "无响应"}
         </span>
-        <span className="text-[10px] text-muted-foreground" title="顺延完仍然没救回来的请求数">
-          最终失败 <b className={cn("tabular-nums", group.failed_requests > 0 ? "text-danger" : "text-foreground")}>{group.failed_requests}</b>
+        {item.error_type ? <span className="rounded bg-muted px-1">{item.error_type}</span> : null}
+        <span className="truncate" title={`${item.gateway_group_name} · ${item.route_label ?? ""}`}>
+          {item.gateway_group_name}
+          {item.route_label ? <> · <span className="text-foreground">{item.route_label}</span></> : null}
         </span>
-        <SeverityCounts severity={group.severity} className="text-[10px]" />
-        <span className="text-[10px] tabular-nums text-muted-foreground">
-          问题路由 <b className={group.problem_routes > 0 ? "text-warning" : "text-foreground"}>{group.problem_routes}</b>/{group.routes.length}
+        {item.model ? <span className="truncate">{item.model}</span> : null}
+        <span title="同一 request_id 下的第几次尝试">
+          第 {item.attempt} 次{item.attempt_kind && item.attempt_kind !== "primary" ? ` · ${item.attempt_kind}` : ""}
         </span>
-      </button>
+        <span>{formatDuration(item.duration_ms)}</span>
+        <span className="ml-auto flex items-center gap-1">
+          {extras.length > 0 ? (
+            <button type="button" onClick={() => setOpen((value) => !value)}
+              className="rounded px-1 hover:bg-muted hover:text-foreground">
+              {open ? "收起原文" : `展开原文（${extras.length}）`}
+            </button>
+          ) : null}
+          <button type="button" onClick={copy} title="复制整条记录（JSON）"
+            className="inline-flex items-center gap-0.5 rounded px-1 hover:bg-muted hover:text-foreground">
+            <Copy className="size-2.5" />{copied ? "已复制" : "复制"}
+          </button>
+        </span>
+      </div>
+      {/* 原文按上游返回的样子铺开：不截断、不改写、不合并 */}
+      <pre className="mt-0.5 max-h-28 overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-tight text-foreground">
+        {item.message || "（上游没有返回错误正文）"}
+      </pre>
       {open ? (
-        <div className="border-t border-border/70 bg-muted/10">
-          {visible.length === 0
-            ? <p className="px-2 py-2 text-[10px] text-muted-foreground">该网关下没有需要关注的路由（勾选「含健康路由」可看全部 {group.routes.length} 条）</p>
-            : visible.map((route) => <AttentionRoute key={route.route_id} route={route} />)}
+        <div className="mt-1 space-y-1">
+          {item.upstream_url ? <div className="font-mono text-[10px] text-muted-foreground">{item.upstream_url}</div> : null}
+          {[["error_detail", item.detail], ["upstream_error_body", item.upstream_body], ["upstream_error_headers", item.upstream_headers]]
+            .filter(([, value]) => Boolean(value))
+            .map(([label, value]) => (
+              <div key={label as string}>
+                <div className="text-[9px] uppercase tracking-wide text-muted-foreground">{label}</div>
+                <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 font-mono text-[10px] leading-tight">
+                  {value}
+                </pre>
+              </div>
+            ))}
         </div>
       ) : null}
     </div>
   )
 }
 
-function errorPieOption(data: GatewayDispatchErrorScope) {
-  const inner = data.categories.map((category) => ({
-    name: category.label, value: category.count,
-    itemStyle: { color: ERROR_COLORS[category.error_type] ?? "#98a3b4" },
-  }))
-  // 外环：状态码明细，继承所属分类的色相并按占比递减透明度，保持父子可辨认
-  const outer = data.categories.flatMap((category) =>
-    category.codes.map((code, index) => ({
-      name: `${category.label} · ${code.label}`, value: code.count,
-      itemStyle: { color: ERROR_COLORS[category.error_type] ?? "#98a3b4", opacity: Math.max(0.35, 1 - index * 0.2) },
-    })),
-  )
-  return {
-    animationDuration: 200,
-    tooltip: {
-      trigger: "item" as const, confine: true, borderColor: "#dde3ea", textStyle: { fontSize: 11 },
-      formatter: (params: unknown) => {
-        const item = params as { name?: string; value?: number; percent?: number; marker?: string }
-        return `${item.marker ?? ""}${item.name ?? ""}<br/><b>${item.value ?? 0}</b> 次 · ${(item.percent ?? 0).toFixed(1)}%`
-      },
-    },
-    legend: { show: false },
-    series: [
-      {
-        type: "pie" as const, radius: ["30%", "52%"], center: ["50%", "50%"], data: inner,
-        label: { show: false }, labelLine: { show: false },
-        emphasis: { scale: false, itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,.15)" } },
-      },
-      {
-        type: "pie" as const, radius: ["58%", "76%"], center: ["50%", "50%"], data: outer,
-        label: { show: false }, labelLine: { show: false },
-        emphasis: { scale: false, itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,.15)" } },
-      },
-    ],
-  }
-}
-
 export function DispatchHealthPanel() {
   const [rangeValue, setRangeValue] = useState<GatewayDispatchWindow>("1h")
-  const [showHealthy, setShowHealthy] = useState(false)
-  // null = 还没手动点过，用默认展开（最该处理的那个网关）
-  const [openGroups, setOpenGroups] = useState<number[] | null>(null)
-  const [errorGatewayID, setErrorGatewayID] = useState<number | null>(null)
-  const [errorRouteID, setErrorRouteID] = useState<number | null>(null)
+  const [drillGateway, setDrillGateway] = useState<{ id: number; name: string } | null>(null)
+  const [scope, setScope] = useState<ErrorScope | null>(null)
+  const [rawLimit, setRawLimit] = useState(RAW_LIMITS[0])
   const tick = useRefreshTick()
 
   // 跟着全局刷新 tick 一起前滚，窗口才是"最近 N"而不是"打开页面那一刻起的 N"
@@ -284,63 +230,78 @@ export function DispatchHealthPanel() {
     return { from: from.toISOString(), to: to.toISOString() }
   }, [rangeValue, tick])
 
-  const attention = useGatewayDispatchAttention(range.from, range.to)
-  const errors = useGatewayDispatchErrors(range.from, range.to)
-  const groups = useMemo(() => attention.data?.groups ?? [], [attention.data])
-  const errorData = errors.data
+  const flow = useGatewayDispatchFlow(range.from, range.to, drillGateway?.id)
+  const rawErrors = useGatewayDispatchRawErrors(
+    range.from, range.to, scope?.gatewayID, scope?.routeID, rawLimit,
+  )
 
-  // 默认展开排第一的网关（排序已经保证它最该处理），手动点过之后完全交给用户
-  const effectiveOpen = useMemo(() => {
-    if (openGroups != null) return new Set(openGroups)
-    const first = groups.find((group) => group.problem_routes > 0) ?? groups[0]
-    return new Set(first ? [first.gateway_group_id] : [])
-  }, [openGroups, groups])
+  const chartRef = useRef<HTMLDivElement | null>(null)
+  const chart = useRef<echarts.ECharts | null>(null)
+  const flowData = flow.data
 
-  const toggleGroup = (id: number) => {
-    setOpenGroups((current) => {
-      const next = new Set(current ?? effectiveOpen)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return [...next]
-    })
-  }
-
-  const errorRef = useRef<HTMLDivElement | null>(null)
-  const errorChart = useRef<echarts.ECharts | null>(null)
-
-  const errorGateway = errorGatewayID == null ? undefined : errorData?.groups.find((group) => group.gateway_group_id === errorGatewayID)
-  const errorRoute = errorRouteID == null ? undefined : errorGateway?.routes.find((route) => route.route_id === errorRouteID)
-  const errorScope: GatewayDispatchErrorScope = errorRoute ?? errorGateway ?? errorData ?? EMPTY_ERROR_SCOPE
-  const scopeLabel = errorRoute ? `路由：${errorRoute.route_name}` : errorGateway ? `网关：${errorGateway.gateway_group_name}` : "全部网关"
-
-  // 数据刷新后选中的网关/路由可能已经消失，及时复位免得卡在空作用域
+  // 下钻后如果那个网关在新窗口里没数据了，退回全部网关，免得卡在空图上
   useEffect(() => {
-    if (!errorData) return
-    if (errorGatewayID != null && !errorData.groups.some((group) => group.gateway_group_id === errorGatewayID)) {
-      setErrorGatewayID(null)
-      setErrorRouteID(null)
+    if (!flowData || !drillGateway) return
+    if (flowData.scope === "gateway" && flowData.requests === 0) {
+      setDrillGateway(null)
+      setScope(null)
+    }
+  }, [flowData, drillGateway])
+
+  const handleNodeClick = useCallback((node: GatewayDispatchFlowNode) => {
+    if (node.kind === "gateway" && !drillGateway) {
+      setDrillGateway({ id: node.gateway_group_id ?? 0, name: node.label })
+      setScope({ gatewayID: node.gateway_group_id ?? 0, gatewayName: node.label })
       return
     }
-    if (errorRouteID != null && errorGateway && !errorGateway.routes.some((route) => route.route_id === errorRouteID)) {
-      setErrorRouteID(null)
+    if (node.kind === "route" && drillGateway) {
+      // 点路由不跳走，只把下面的原始报错收窄到这条路由——跳转另有链接
+      setScope((current) => current?.routeID === node.route_id
+        ? { gatewayID: drillGateway.id, gatewayName: drillGateway.name }
+        : { gatewayID: drillGateway.id, gatewayName: drillGateway.name, routeID: node.route_id, routeLabel: node.label })
     }
-  }, [errorData, errorGatewayID, errorRouteID, errorGateway])
+  }, [drillGateway])
 
   useEffect(() => {
-    if (!errorRef.current) return
-    if (errorScope.categories.length === 0) {
-      errorChart.current?.dispose()
-      errorChart.current = null
+    if (!chartRef.current) return
+    if (!flowData || flowData.nodes.length === 0) {
+      chart.current?.dispose()
+      chart.current = null
       return
     }
-    if (!errorChart.current) errorChart.current = echarts.init(errorRef.current)
-    errorChart.current.setOption(errorPieOption(errorScope), true)
-    const resize = () => errorChart.current?.resize()
+    if (!chart.current) chart.current = echarts.init(chartRef.current)
+    const instance = chart.current
+    instance.setOption(flowOption(flowData), true)
+    const onClick = (params: { dataType?: string; data?: unknown }) => {
+      if (params.dataType !== "node") return
+      const raw = (params.data as { raw?: GatewayDispatchFlowNode })?.raw
+      if (raw) handleNodeClick(raw)
+    }
+    instance.off("click")
+    instance.on("click", onClick)
+    const resize = () => instance.resize()
     window.addEventListener("resize", resize)
     return () => window.removeEventListener("resize", resize)
-  }, [errorScope])
+  }, [flowData, handleNodeClick])
 
-  useEffect(() => () => { errorChart.current?.dispose(); errorChart.current = null }, [])
+  useEffect(() => () => { chart.current?.dispose(); chart.current = null }, [])
+
+  const outcomes = useMemo(() => {
+    const result = { direct: 0, recovered: 0, failed: 0 }
+    for (const node of flowData?.nodes ?? []) {
+      if (node.kind === "outcome" && node.outcome && node.outcome in result) {
+        result[node.outcome as keyof typeof result] = node.value
+      }
+    }
+    return result
+  }, [flowData])
+
+  const height = flowHeight(flowData)
+  const rawScopeLabel = scope?.routeLabel
+    ? `${scope.gatewayName} · ${scope.routeLabel}`
+    : scope
+    ? scope.gatewayName
+    : "全部网关"
 
   return <Card className="overflow-hidden border border-border py-2 shadow-none sm:py-3">
     <CardHeader className="gap-2 px-3 pb-2 sm:flex sm:flex-row sm:items-center sm:justify-between sm:px-4">
@@ -361,104 +322,87 @@ export function DispatchHealthPanel() {
     </CardHeader>
 
     <CardContent className="px-3 pb-2 sm:px-4">
-      {/* ---- 建议关注 ---- */}
-      <div className="mb-1.5 flex h-6 flex-wrap items-center justify-between gap-2">
-        <h3 className="text-xs font-semibold">建议关注</h3>
+      {/* ---- 请求流向 ---- */}
+      <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1 text-xs">
+          <h3 className="font-semibold">请求流向</h3>
+          <button type="button" onClick={() => { setDrillGateway(null); setScope(null) }}
+            className={cn("rounded px-1.5 py-0.5 text-[10px]", drillGateway ? "text-muted-foreground hover:bg-muted" : "bg-brand/10 font-medium text-brand")}>
+            全部网关
+          </button>
+          {drillGateway ? <>
+            <ChevronRight className="size-3 text-muted-foreground" />
+            <span className="max-w-52 truncate rounded bg-brand/10 px-1.5 py-0.5 text-[10px] font-medium text-brand">{drillGateway.name}</span>
+            {scope?.routeID ? <>
+              <ChevronRight className="size-3 text-muted-foreground" />
+              <span className="max-w-52 truncate rounded bg-muted px-1.5 py-0.5 text-[10px]">{scope.routeLabel}</span>
+              <Link to={dispatchRoutePath(drillGateway.id, scope.routeID)}
+                className="inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[10px] text-brand hover:underline">
+                <ExternalLink className="size-2.5" />打开路由
+              </Link>
+            </> : null}
+          </> : null}
+        </div>
         <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-          <span>
-            <span className="text-danger">▲</span> 需处理 / <span className="text-warning">●</span> 关注：
-            <b className="tabular-nums text-foreground"> {attention.data?.problem_routes ?? 0}</b> / {attention.data?.routes ?? 0} 条路由
-          </span>
-          <label className="inline-flex cursor-pointer items-center gap-1">
-            <input type="checkbox" className="size-3 accent-current" checked={showHealthy} onChange={(event) => setShowHealthy(event.target.checked)} />
-            含健康路由
-          </label>
+          {flowData ? <>
+            <span><b className="tabular-nums text-foreground">{flowData.requests}</b> 请求 / {flowData.attempts} 次尝试</span>
+            <span style={{ color: FLOW_COLORS.direct }}>一次过 {outcomes.direct}</span>
+            <span style={{ color: FLOW_COLORS.recovered }}>顺延后成功 {outcomes.recovered}</span>
+            <span style={{ color: FLOW_COLORS.failed }}>最终失败 {outcomes.failed}</span>
+            {flowData.max_hops > 1 ? <span>最深 {flowData.max_hops} 跳</span> : null}
+          </> : null}
         </div>
       </div>
+      <p className="mb-1 text-[10px] text-muted-foreground">
+        {drillGateway
+          ? "每一列是第几跳，线越粗走的请求越多；红色的线是「这一跳失败后转走的」。点路由可把下面的报错收窄到它。"
+          : "点任意网关可下钻，看它内部顺延到哪几条路由。"}
+      </p>
 
-      {attention.error
-        ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-[11px] text-danger">建议关注加载失败：{attention.error}</p>
-        : !attention.data
-        ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">加载中…</div>
-        : groups.length === 0
-        ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">当前窗口没有调度记录</div>
-        : <div className="max-h-[34rem] space-y-1 overflow-auto pr-0.5">
-            {groups.map((group) => (
-              <AttentionGroup key={group.gateway_group_id} group={group} showHealthy={showHealthy}
-                open={effectiveOpen.has(group.gateway_group_id)} onToggle={() => toggleGroup(group.gateway_group_id)} />
-            ))}
+      {flow.error
+        ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-[11px] text-danger">请求流向加载失败：{flow.error}</p>
+        : !flowData
+        ? <div className="flex h-56 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">加载中…</div>
+        : flowData.nodes.length === 0
+        ? <div className="flex h-56 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">当前窗口没有调度记录</div>
+        : <div className="rounded-md border border-border/70 bg-muted/10">
+            <div ref={chartRef} style={{ height }} className="w-full" />
           </div>}
 
-      {/* ---- 错误分布下钻 ---- */}
+      {/* ---- 原始报错 ---- */}
       <div className="mt-3 border-t border-border pt-3">
-        <div className="mb-1.5 flex h-6 items-center justify-between">
-          <h3 className="text-xs font-semibold">错误分布</h3>
-          <div className="flex items-center gap-1.5 text-[10px]">
-            <span className="text-muted-foreground">范围</span>
-            <button type="button" onClick={() => { setErrorGatewayID(null); setErrorRouteID(null) }} className={cn("rounded px-1.5 py-0.5", errorGatewayID == null ? "bg-brand/10 font-medium text-brand" : "text-muted-foreground hover:bg-muted")}>全部网关</button>
-            {errorGateway ? <><span className="text-muted-foreground">›</span><button type="button" onClick={() => setErrorRouteID(null)} className={cn("max-w-40 truncate rounded px-1.5 py-0.5", errorRouteID == null ? "bg-brand/10 font-medium text-brand" : "text-muted-foreground hover:bg-muted")}>{errorGateway.gateway_group_name}</button></> : null}
-            {errorRoute ? <><span className="text-muted-foreground">›</span><span className="max-w-40 truncate rounded bg-brand/10 px-1.5 py-0.5 font-medium text-brand">{errorRoute.route_name}</span></> : null}
+        <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-xs font-semibold">
+            原始报错
+            <span className="ml-1.5 font-normal text-[10px] text-muted-foreground">上游原话，不归类不合并不截断</span>
+          </h3>
+          <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+            <span>范围 <b className="text-foreground">{rawScopeLabel}</b></span>
+            {rawErrors.data ? <span>共 <b className="tabular-nums text-foreground">{rawErrors.data.total}</b> 条失败尝试</span> : null}
+            <span className="inline-flex rounded border border-border bg-muted/30 p-0.5">
+              {RAW_LIMITS.map((limit) => (
+                <button key={limit} type="button" onClick={() => setRawLimit(limit)}
+                  className={cn("rounded px-1.5 py-0.5", rawLimit === limit ? "bg-background font-medium text-foreground shadow-sm" : "")}>
+                  最近 {limit}
+                </button>
+              ))}
+            </span>
           </div>
         </div>
-        {errors.error ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-[11px] text-danger">错误分布加载失败：{errors.error}</p>
-          : !errorData ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">加载中…</div>
-          : errorData.failed_attempts === 0 ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">当前窗口没有失败记录</div>
-          : <div className="grid gap-3 lg:grid-cols-12">
-          <div className="min-w-0 lg:col-span-3">
-            <div className="mb-1 text-[10px] text-muted-foreground">按网关（P0 优先）</div>
-            <div className="h-44 space-y-0.5 overflow-y-auto rounded-md border border-border/70 bg-muted/20 p-1.5">
-              {errorData.groups.map((group) => <button type="button" key={group.gateway_group_id} onClick={() => { setErrorGatewayID((current) => current === group.gateway_group_id ? null : group.gateway_group_id); setErrorRouteID(null) }} aria-pressed={errorGatewayID === group.gateway_group_id} className={cn("flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] transition-colors hover:bg-background", errorGatewayID === group.gateway_group_id && "bg-background shadow-sm ring-1 ring-border")}>
-                <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={group.gateway_group_name}>{group.gateway_group_name}</span><span className="block text-[10px] text-muted-foreground">{`最终失败 ${group.final_failed} / ${group.requests} 请求`}</span></span>
-                <span className="shrink-0 text-right"><span className={cn("block text-[11px] font-semibold tabular-nums", group.severity.p0 > 0 ? "text-danger" : "text-warning")}>{group.severity.p0 > 0 ? `P0 ${group.severity.p0}` : `P1 ${group.severity.p1}`}</span><span className="block text-[9px] text-muted-foreground">{group.failed_attempts} 失败尝试</span></span>
-              </button>)}
-            </div>
-          </div>
-          <div className="min-w-0 lg:col-span-3">
-            <div className="mb-1 truncate text-[10px] text-muted-foreground">{errorGateway ? `${errorGateway.gateway_group_name} 下的路由` : "选中一个网关后可下钻到路由"}</div>
-            <div className="h-44 space-y-0.5 overflow-y-auto rounded-md border border-border/70 bg-muted/20 p-1.5">
-              {!errorGateway ? <p className="p-2 text-[11px] text-muted-foreground">左侧点选网关</p>
-                : errorGateway.routes.filter((route) => route.failed_attempts > 0).length === 0 ? <p className="p-2 text-[11px] text-muted-foreground">该网关下没有失败的路由</p>
-                : errorGateway.routes.filter((route) => route.failed_attempts > 0).map((route) => <button type="button" key={route.route_id} onClick={() => setErrorRouteID((current) => current === route.route_id ? null : route.route_id)} aria-pressed={errorRouteID === route.route_id} className={cn("flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] transition-colors hover:bg-background", errorRouteID === route.route_id && "bg-background shadow-sm ring-1 ring-border")}>
-                  <span className="min-w-0 flex-1"><span className="block truncate font-medium" title={route.route_name}>{route.route_name}</span><span className="block truncate text-[10px] text-muted-foreground" title={route.provider_name}>{route.provider_name || `${route.attempts} 次尝试`}</span></span>
-                  <span className="shrink-0 text-right"><span className="block text-[11px] font-semibold tabular-nums text-danger">{route.failed_attempts}</span><span className="block text-[9px] text-muted-foreground">{`${(route.attempt_error_rate * 100).toFixed(1)}%`}</span></span>
-                </button>)}
-            </div>
-          </div>
-          <div className="min-w-0 lg:col-span-3">
-            <div className="mb-1 truncate text-[10px] text-muted-foreground">{scopeLabel}</div>
-            <div className="flex h-44 flex-col rounded-md border border-border/70 bg-muted/20 p-1">
-              <div ref={errorRef} className="min-h-0 w-full flex-1" />
-              <div className="grid grid-cols-3 gap-1 pb-0.5 text-center">
-                {SEVERITY_META.map((severity) => (
-                  <div key={severity.key} title={severity.hint}>
-                    <div className="text-[12px] font-semibold tabular-nums" style={{ color: errorScope.severity[severity.key] > 0 ? severity.color : undefined }}>
-                      {errorScope.severity[severity.key]}
-                    </div>
-                    <div className="text-[9px] text-muted-foreground">{severity.label}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-          <div className="min-w-0 lg:col-span-3">
-            <div className="mb-1 text-[10px] text-muted-foreground">高频错误（P0 优先）</div>
-            <div className="flex h-44 flex-col gap-1 rounded-md border border-border/70 bg-muted/20 p-1.5">
-              <div className="flex flex-wrap gap-x-2 gap-y-0.5">{errorScope.categories.map((category) => <span key={category.error_type} className="inline-flex items-center gap-1 text-[10px] text-muted-foreground"><span className="size-2 rounded-full" style={{ backgroundColor: ERROR_COLORS[category.error_type] ?? "#98a3b4" }} />{category.label} {category.count}</span>)}</div>
-              <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto">
-                {[...errorScope.samples].sort((a, b) => a.severity - b.severity || b.count - a.count).map((sample) => <div key={`${sample.error_type}-${sample.status_code}-${sample.message}`} className="rounded px-1 py-0.5 text-[10px] leading-tight">
-                  <div className="flex items-center justify-between gap-1">
-                    <span className="flex items-center gap-1">
-                      <span className="rounded px-1 font-medium text-white" style={{ backgroundColor: SEVERITY_META[sample.severity]?.color ?? "#98a3b4" }} title={SEVERITY_META[sample.severity]?.hint}>{SEVERITY_META[sample.severity]?.label ?? "P?"}</span>
-                      <span className="font-medium" style={{ color: ERROR_COLORS[sample.error_type] ?? "#98a3b4" }}>{sample.status_code > 0 ? sample.status_code : "无响应"}</span>
-                    </span>
-                    <span className="tabular-nums text-muted-foreground">{sample.count} 次</span>
-                  </div>
-                  <div className="truncate text-muted-foreground" title={sample.message}>{sample.message}</div>
-                </div>)}
-              </div>
-            </div>
-          </div>
-        </div>}
+        {rawErrors.error
+          ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-[11px] text-danger">原始报错加载失败：{rawErrors.error}</p>
+          : !rawErrors.data
+          ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">加载中…</div>
+          : rawErrors.data.items.length === 0
+          ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">当前范围没有失败记录</div>
+          : <div className="max-h-[30rem] overflow-auto rounded-md border border-border/70">
+              {rawErrors.data.items.map((item) => <RawErrorRow key={item.id} item={item} />)}
+              {rawErrors.data.total > rawErrors.data.items.length ? (
+                <p className="border-t border-border/60 px-2 py-1.5 text-[10px] text-muted-foreground">
+                  仅显示最近 {rawErrors.data.items.length} 条，窗口内共 {rawErrors.data.total} 条——换更长的「最近 N」或缩短时间粒度可以看更多。
+                </p>
+              ) : null}
+            </div>}
       </div>
     </CardContent>
   </Card>

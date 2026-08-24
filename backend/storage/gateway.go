@@ -1189,14 +1189,6 @@ func (r *GatewayUsageLogs) DispatchErrors(from, to time.Time) (GatewayDispatchEr
 	return result, nil
 }
 
-// ---- 建议关注 ----
-//
-// 这一块回答的是「现在该盯哪条路由、要不要把它禁掉」。组织方式是**按网关折叠**：
-// 网关是运维的操作单位（一个网关一组备选路由），先看哪个网关在顺延，再展开看是
-// 哪条路由拖的后腿，最后看它最近这些请求到底成没成。
-//
-// 跟 DispatchErrors 的分工：那个按错误类型下钻（错在哪），这个按路由排队（谁该处理）。
-
 // 错误分级按「要不要人工介入」划分，不是按 HTTP 状态码，也不是按用户影响面：
 //
 //	P0 需人工处理——认证失效 / 欠费 / 分组被删 / 配置写错，放着永远不会自愈
@@ -1239,473 +1231,564 @@ type GatewayDispatchSeverityCounts struct {
 
 // GatewayDispatchAttempt 是「最近请求状态」里的一格。
 // 只带够画一格 + 悬浮解释的字段，不把整条日志抬出来。
-type GatewayDispatchAttempt struct {
-	Timestamp time.Time `json:"timestamp"`
-	Success   bool      `json:"success"`
-	// Severity 失败时为 P0/P1/P2，成功时为 -1
-	Severity     int    `json:"severity"`
-	StatusCode   int    `json:"status_code,omitempty"`
-	AttemptKind  string `json:"attempt_kind,omitempty"`
-	Model        string `json:"model,omitempty"`
-	FirstTokenMS int64  `json:"first_token_ms,omitempty"`
-	Message      string `json:"message,omitempty"`
-}
+// ---- 调度流向 ----
+//
+// 这一块回答的是「请求在网关里怎么流的」：默认把窗口内所有请求按网关分流，再分到
+// 三种结局；下钻到某个网关后，按「第几跳打在哪条路由上」逐层展开——顺延本来就是
+// 一条链上的流动，用桑基图画比任何汇总表都直白。
+//
+// 跟 DispatchErrors 的分工：那个按错误类型下钻（错在哪），这个看流量走向（去哪了）。
 
-type GatewayDispatchAttentionRoute struct {
-	RouteID        uint `json:"route_id"`
-	GatewayGroupID uint `json:"gateway_group_id"`
-	// SourceName 来源（渠道名，或 provider 路由的 provider 名）；
-	// SourceGroupName 源分组。两者才是人能认出来的身份，密钥名只是兜底。
-	SourceName      string `json:"source_name,omitempty"`
-	SourceGroupName string `json:"source_group_name,omitempty"`
-	KeyName         string `json:"key_name,omitempty"`
-	// Alive=false 表示路由已被删除，只剩历史日志；此时前端不提供跳转。
-	Alive   bool `json:"alive"`
-	Enabled bool `json:"enabled"`
+// dispatchFlowMaxHops 桑基图最多铺开几跳；更深的顺延收进一个「更深层顺延」节点，
+// 免得少数极端链把图拉得又长又细。
+const dispatchFlowMaxHops = 5
 
-	Requests       int     `json:"requests"`
-	Attempts       int     `json:"attempts"`
-	FailedAttempts int     `json:"failed_attempts"`
-	FailoverRate   float64 `json:"failover_rate"`
-	// MaxFailoverDepth：该路由失败所在的请求链里，顺延次数最多的那条链顺延了几次。
-	// 回答「这条路由挂掉时，整个链还要再折腾几跳」。
-	MaxFailoverDepth int `json:"max_failover_depth"`
-	// 连败：CurrentFailStreak 是窗口末尾还在连着败的次数（正在坏），
-	// MaxFailStreak 是窗口内最长的一段（坏得最狠时有多狠）。
-	// 连败比失败率更能说明「该禁了」——20% 失败率散着出现是抖动，连着 8 次就是挂了。
-	CurrentFailStreak int                           `json:"current_fail_streak"`
-	MaxFailStreak     int                           `json:"max_fail_streak"`
-	TTFTP95           float64                       `json:"ttft_p95"`
-	Severity          GatewayDispatchSeverityCounts `json:"severity"`
-	TopError          string                        `json:"top_error,omitempty"`
-	Health            string                        `json:"health"`
-	// Recent 最近若干次尝试，按时间正序（左旧右新）
-	Recent []GatewayDispatchAttempt `json:"recent"`
-}
-
-type GatewayDispatchAttentionGroup struct {
-	GatewayGroupID   uint   `json:"gateway_group_id"`
-	GatewayGroupName string `json:"gateway_group_name"`
-	Health           string `json:"health"`
-
-	Requests int `json:"requests"`
-	// FailoverRequests 至少顺延过一次的请求数；FailedRequests 顺延完还是没救回来的请求数。
-	// 网关这一层看「请求有没有被救回来」，路由那一层才看尝试级失败率——别混。
-	FailoverRequests    int                             `json:"failover_requests"`
-	FailedRequests      int                             `json:"failed_requests"`
-	RequestFailoverRate float64                         `json:"request_failover_rate"`
-	Attempts            int                             `json:"attempts"`
-	FailedAttempts      int                             `json:"failed_attempts"`
-	TTFTP95             float64                         `json:"ttft_p95"`
-	Severity            GatewayDispatchSeverityCounts   `json:"severity"`
-	ProblemRoutes       int                             `json:"problem_routes"`
-	Routes              []GatewayDispatchAttentionRoute `json:"routes"`
-}
-
-type GatewayDispatchAttention struct {
-	From          time.Time                       `json:"from"`
-	To            time.Time                       `json:"to"`
-	Routes        int                             `json:"routes"`
-	ProblemRoutes int                             `json:"problem_routes"`
-	Severity      GatewayDispatchSeverityCounts   `json:"severity"`
-	Groups        []GatewayDispatchAttentionGroup `json:"groups"`
-}
-
-// 健康判定阈值。
-// P0 用「占尝试的比例」而不是「有没有」：370 次尝试里偶发 1 次配置错，
-// 跟 411 次余额不足完全不是一回事，一律标红会让这个标记失去意义。
 const (
-	dispatchActionP0Rate     = 0.01 // P0 占尝试 1% 以上 → 需处理
-	dispatchActionFailover   = 0.5  // 顺延率过半 → 需处理
-	dispatchActionFailStreak = 5    // 末尾连败 5 次以上 → 需处理（正在挂）
-	dispatchWatchFailover    = 0.1  // 顺延率上双位数 → 关注
-	dispatchWatchFailStreak  = 3
-	dispatchWatchTTFTMillis  = 10_000
+	dispatchFlowNodeRoot     = "root"
+	dispatchFlowNodeGateway  = "gateway"
+	dispatchFlowNodeRoute    = "route"
+	dispatchFlowNodeOverflow = "overflow"
+	dispatchFlowNodeOutcome  = "outcome"
 )
 
-func dispatchRouteHealth(route GatewayDispatchAttentionRoute) string {
-	p0Rate := 0.0
-	if route.Attempts > 0 {
-		p0Rate = float64(route.Severity.P0) / float64(route.Attempts)
-	}
-	if p0Rate >= dispatchActionP0Rate ||
-		route.FailoverRate >= dispatchActionFailover ||
-		route.CurrentFailStreak >= dispatchActionFailStreak {
-		return "action"
-	}
-	// 有 P0 但占比不高，仍然值得看一眼，只是不到「立刻处理」
-	if route.Severity.P0 > 0 ||
-		route.FailoverRate >= dispatchWatchFailover ||
-		route.CurrentFailStreak >= dispatchWatchFailStreak ||
-		route.TTFTP95 > dispatchWatchTTFTMillis {
-		return "watch"
-	}
-	return "ok"
+// 三种结局。拆成三个而不是「成功/失败」两个，是因为「一次就过」和「顺延了几跳才救回来」
+// 对上游质量的含义完全不同，前者不用管，后者是在拿延迟换成功率。
+const (
+	dispatchOutcomeDirect    = "direct"
+	dispatchOutcomeRecovered = "recovered"
+	dispatchOutcomeFailed    = "failed"
+)
+
+type GatewayDispatchFlowNode struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	// Kind: root | gateway | route | overflow | outcome
+	Kind  string `json:"kind"`
+	Depth int    `json:"depth"`
+	Value int    `json:"value"`
+
+	GatewayGroupID uint `json:"gateway_group_id,omitempty"`
+	RouteID        uint `json:"route_id,omitempty"`
+	// Hop 路由节点在第几跳（1 = 首发）
+	Hop int `json:"hop,omitempty"`
+	// Alive=false 表示路由已删除，只剩历史日志，前端不给跳转
+	Alive   bool   `json:"alive,omitempty"`
+	Outcome string `json:"outcome,omitempty"`
 }
 
-// 排序档位，数字越小越靠前
-func dispatchHealthRank(health string) int {
-	switch health {
-	case "action":
-		return 0
-	case "watch":
-		return 1
-	default:
-		return 2
-	}
+type GatewayDispatchFlowLink struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+	Value  int    `json:"value"`
+	// Failed=true 表示这股流量是「上一跳失败之后转走的」
+	Failed bool `json:"failed"`
 }
 
-// 每条路由保留多少格「最近请求状态」。够铺满一行又不至于把响应撑大。
-const dispatchRecentAttempts = 30
+type GatewayDispatchFlow struct {
+	From time.Time `json:"from"`
+	To   time.Time `json:"to"`
+	// Scope: all（按网关分流）| gateway（按跳数分流到路由）
+	Scope            string `json:"scope"`
+	GatewayGroupID   uint   `json:"gateway_group_id,omitempty"`
+	GatewayGroupName string `json:"gateway_group_name,omitempty"`
+	Requests         int    `json:"requests"`
+	Attempts         int    `json:"attempts"`
+	// MaxHops 窗口内实际出现过的最深跳数（可能超过 dispatchFlowMaxHops）
+	MaxHops int                       `json:"max_hops"`
+	Nodes   []GatewayDispatchFlowNode `json:"nodes"`
+	Links   []GatewayDispatchFlowLink `json:"links"`
+}
 
-type dispatchAttentionAcc struct {
-	groupID   uint
+// dispatchFlowAttempt 是一条链上的一次尝试，只留画图要用的字段。
+type dispatchFlowAttempt struct {
+	routeID uint
+	success bool
+}
+
+type dispatchFlowChain struct {
+	groupID  uint
+	attempts []dispatchFlowAttempt
+}
+
+// dispatchRouteIdentity 把日志快照里的来源信息拼成人能认出来的名字。
+// 优先级跟前端 formatRouteIdentity 一致：来源（渠道名 / provider 名）· 源分组，
+// 密钥名只在两者双双缺失时兜底——密钥名（uops-ch9-sgn-xxx）对人没有意义。
+type dispatchRouteIdentity struct {
 	channelID uint
 	provider  string
 	srcGroup  string
 	keyName   string
-
-	attempts int
-	failed   int
-	ttft     []float64
-	severity GatewayDispatchSeverityCounts
-	errors   map[string]int
-	chains   map[string]struct{}
-	// failedChains 记录该路由失败过的链，用于算 MaxFailoverDepth
-	failedChains map[string]struct{}
-
-	curStreak int
-	maxStreak int
-	recent    []GatewayDispatchAttempt
 }
 
-func newDispatchAttentionAcc() *dispatchAttentionAcc {
-	return &dispatchAttentionAcc{
-		errors:       make(map[string]int),
-		chains:       make(map[string]struct{}),
-		failedChains: make(map[string]struct{}),
-		recent:       make([]GatewayDispatchAttempt, 0, dispatchRecentAttempts),
+func (d dispatchRouteIdentity) label(routeID uint, channelNames map[uint]string) string {
+	parts := make([]string, 0, 2)
+	if name := channelNames[d.channelID]; name != "" {
+		parts = append(parts, name)
+	} else if d.provider != "" {
+		parts = append(parts, d.provider)
+	}
+	if d.srcGroup != "" {
+		parts = append(parts, d.srcGroup)
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, " · ")
+	}
+	if d.keyName != "" {
+		return d.keyName
+	}
+	return fmt.Sprintf("路由 #%d", routeID)
+}
+
+func (d *dispatchRouteIdentity) absorb(log GatewayUsageLog) {
+	// 取最后出现的非空值：路由改过名就以最新的为准
+	if log.ChannelID > 0 {
+		d.channelID = log.ChannelID
+	}
+	if log.ProviderName != "" {
+		d.provider = log.ProviderName
+	}
+	if log.SourceGroupName != "" {
+		d.srcGroup = log.SourceGroupName
+	}
+	if log.SourceAPIKeyName != "" {
+		d.keyName = log.SourceAPIKeyName
 	}
 }
 
-func (a *dispatchAttentionAcc) pushRecent(mark GatewayDispatchAttempt) {
-	a.recent = append(a.recent, mark)
-	if len(a.recent) > dispatchRecentAttempts {
-		a.recent = a.recent[len(a.recent)-dispatchRecentAttempts:]
+// dispatchFlowBuilder 累积节点和边，保证同一个 id 只出现一次。
+type dispatchFlowBuilder struct {
+	nodes map[string]*GatewayDispatchFlowNode
+	order []string
+	links map[string]*GatewayDispatchFlowLink
+	edges []string
+}
+
+func newDispatchFlowBuilder() *dispatchFlowBuilder {
+	return &dispatchFlowBuilder{
+		nodes: make(map[string]*GatewayDispatchFlowNode),
+		links: make(map[string]*GatewayDispatchFlowLink),
 	}
 }
 
-// dispatchChainState 是一条请求链（同网关 + 同 RequestID）的汇总。
-type dispatchChainState struct {
-	groupID   uint
-	failovers int
-	// lastFailed 按时间序不断覆盖，收尾时就是「这条链最终成没成」
-	lastFailed bool
+func (b *dispatchFlowBuilder) node(node GatewayDispatchFlowNode) {
+	if _, ok := b.nodes[node.ID]; ok {
+		return
+	}
+	copied := node
+	b.nodes[node.ID] = &copied
+	b.order = append(b.order, node.ID)
 }
 
-// DispatchAttention 按网关折叠汇总窗口内的调度健康度。
-func (r *GatewayUsageLogs) DispatchAttention(from, to time.Time) (GatewayDispatchAttention, error) {
+func (b *dispatchFlowBuilder) link(source, target string, failed bool) {
+	key := source + "\x00" + target
+	existing := b.links[key]
+	if existing == nil {
+		b.links[key] = &GatewayDispatchFlowLink{Source: source, Target: target, Value: 1, Failed: failed}
+		b.edges = append(b.edges, key)
+		return
+	}
+	existing.Value++
+}
+
+// build 收口：节点权重按入边求和（根节点没有入边，用出边），再按层 + 权重排序。
+func (b *dispatchFlowBuilder) build() ([]GatewayDispatchFlowNode, []GatewayDispatchFlowLink) {
+	links := make([]GatewayDispatchFlowLink, 0, len(b.edges))
+	for _, key := range b.edges {
+		links = append(links, *b.links[key])
+	}
+	outgoing := make(map[string]int)
+	for _, link := range links {
+		if node := b.nodes[link.Target]; node != nil {
+			node.Value += link.Value
+		}
+		outgoing[link.Source] += link.Value
+	}
+	nodes := make([]GatewayDispatchFlowNode, 0, len(b.order))
+	for _, id := range b.order {
+		node := b.nodes[id]
+		if node.Value == 0 {
+			node.Value = outgoing[id]
+		}
+		nodes = append(nodes, *node)
+	}
+	sort.SliceStable(nodes, func(i, j int) bool {
+		if nodes[i].Depth != nodes[j].Depth {
+			return nodes[i].Depth < nodes[j].Depth
+		}
+		if nodes[i].Value != nodes[j].Value {
+			return nodes[i].Value > nodes[j].Value
+		}
+		return nodes[i].ID < nodes[j].ID
+	})
+	sort.SliceStable(links, func(i, j int) bool {
+		if links[i].Value != links[j].Value {
+			return links[i].Value > links[j].Value
+		}
+		if links[i].Source != links[j].Source {
+			return links[i].Source < links[j].Source
+		}
+		return links[i].Target < links[j].Target
+	})
+	return nodes, links
+}
+
+func dispatchOutcomeOf(attempts []dispatchFlowAttempt) string {
+	if len(attempts) == 0 {
+		return dispatchOutcomeFailed
+	}
+	if !attempts[len(attempts)-1].success {
+		return dispatchOutcomeFailed
+	}
+	if len(attempts) == 1 {
+		return dispatchOutcomeDirect
+	}
+	return dispatchOutcomeRecovered
+}
+
+var dispatchOutcomeLabels = map[string]string{
+	dispatchOutcomeDirect:    "一次过",
+	dispatchOutcomeRecovered: "顺延后成功",
+	dispatchOutcomeFailed:    "最终失败",
+}
+
+// DispatchFlow 汇总窗口内的请求流向。groupID = 0 时是「全部网关」视图，
+// 否则下钻到该网关内部，按跳数展开到具体路由。
+func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint) (GatewayDispatchFlow, error) {
 	if from.IsZero() || to.IsZero() || !to.After(from) {
-		return GatewayDispatchAttention{}, fmt.Errorf("invalid dispatch attention range")
+		return GatewayDispatchFlow{}, fmt.Errorf("invalid dispatch flow range")
 	}
+	scope := "all"
+	if groupID > 0 {
+		scope = "gateway"
+	}
+	result := GatewayDispatchFlow{
+		From: from, To: to, Scope: scope, GatewayGroupID: groupID,
+		Nodes: []GatewayDispatchFlowNode{}, Links: []GatewayDispatchFlowLink{},
+	}
+
 	var logs []GatewayUsageLog
 	query := r.db.Where("created_at >= ? AND created_at < ?", from, to)
 	if isSQLite(r.db) {
 		query = r.db.Where("CAST(strftime('%s', created_at) AS INTEGER) >= ? AND CAST(strftime('%s', created_at) AS INTEGER) < ?", from.Unix(), to.Unix())
 	}
-	if err := query.Order("created_at ASC, id ASC").Find(&logs).Error; err != nil {
-		return GatewayDispatchAttention{}, err
+	if groupID > 0 {
+		query = query.Where("gateway_group_id = ?", groupID)
 	}
-	result := GatewayDispatchAttention{From: from, To: to, Groups: []GatewayDispatchAttentionGroup{}}
+	if err := query.Order("created_at ASC, id ASC").Find(&logs).Error; err != nil {
+		return GatewayDispatchFlow{}, err
+	}
 	if len(logs) == 0 {
 		return result, nil
 	}
 
-	routes := make(map[uint]*dispatchAttentionAcc)
-	routeOrder := make([]uint, 0)
-	chains := make(map[string]*dispatchChainState)
+	chains := make(map[string]*dispatchFlowChain)
+	chainOrder := make([]string, 0)
+	identities := make(map[uint]*dispatchRouteIdentity)
+	groupIDs := make(map[uint]struct{})
+	channelIDs := make(map[uint]struct{})
+	routeIDs := make(map[uint]struct{})
 
 	for _, log := range logs {
-		acc := routes[log.RouteID]
-		if acc == nil {
-			acc = newDispatchAttentionAcc()
-			acc.groupID = log.GatewayGroupID
-			routes[log.RouteID] = acc
-			routeOrder = append(routeOrder, log.RouteID)
-		}
-		// 身份字段取最后出现的非空值：路由改名后以最新的为准
-		if log.ChannelID > 0 {
-			acc.channelID = log.ChannelID
-		}
-		if log.ProviderName != "" {
-			acc.provider = log.ProviderName
-		}
-		if log.SourceGroupName != "" {
-			acc.srcGroup = log.SourceGroupName
-		}
-		if log.SourceAPIKeyName != "" {
-			acc.keyName = log.SourceAPIKeyName
-		}
-
-		chainKey := fmt.Sprintf("%d:%s", log.GatewayGroupID, log.RequestID)
-		chain := chains[chainKey]
+		key := fmt.Sprintf("%d:%s", log.GatewayGroupID, log.RequestID)
+		chain := chains[key]
 		if chain == nil {
-			chain = &dispatchChainState{groupID: log.GatewayGroupID}
-			chains[chainKey] = chain
+			chain = &dispatchFlowChain{groupID: log.GatewayGroupID}
+			chains[key] = chain
+			chainOrder = append(chainOrder, key)
 		}
-		if log.AttemptKind == "failover" {
-			chain.failovers++
+		chain.attempts = append(chain.attempts, dispatchFlowAttempt{routeID: log.RouteID, success: log.Success})
+		groupIDs[log.GatewayGroupID] = struct{}{}
+		routeIDs[log.RouteID] = struct{}{}
+		if log.ChannelID > 0 {
+			channelIDs[log.ChannelID] = struct{}{}
 		}
-		chain.lastFailed = !log.Success
-		acc.chains[chainKey] = struct{}{}
+		identity := identities[log.RouteID]
+		if identity == nil {
+			identity = &dispatchRouteIdentity{}
+			identities[log.RouteID] = identity
+		}
+		identity.absorb(log)
+	}
+	result.Requests = len(chainOrder)
+	result.Attempts = len(logs)
 
-		acc.attempts++
-		var firstToken int64
-		if log.FirstTokenMS != nil && *log.FirstTokenMS > 0 {
-			firstToken = *log.FirstTokenMS
-			acc.ttft = append(acc.ttft, float64(firstToken))
-		}
-		severity := dispatchSeverityOf(log)
-		message := ""
-		if !log.Success {
-			message = strings.TrimSpace(log.ErrorMessage)
-			if message == "" {
-				message = dispatchErrorTypeLabel(log.ErrorType)
-			}
-			if len([]rune(message)) > 120 {
-				message = string([]rune(message)[:120]) + "…"
-			}
-		}
-		acc.pushRecent(GatewayDispatchAttempt{
-			Timestamp:    log.CreatedAt,
-			Success:      log.Success,
-			Severity:     severity,
-			StatusCode:   log.StatusCode,
-			AttemptKind:  log.AttemptKind,
-			Model:        log.RequestedModel,
-			FirstTokenMS: firstToken,
-			Message:      message,
-		})
-
-		if log.Success {
-			acc.curStreak = 0
-			continue
-		}
-		acc.failed++
-		acc.curStreak++
-		if acc.curStreak > acc.maxStreak {
-			acc.maxStreak = acc.curStreak
-		}
-		acc.failedChains[chainKey] = struct{}{}
-		switch severity {
-		case dispatchSeverityP0:
-			acc.severity.P0++
-		case dispatchSeverityP2:
-			acc.severity.P2++
-		default:
-			acc.severity.P1++
-		}
-		acc.errors[message]++
-	}
-
-	// 路由现状：是否还存在、是否启用
-	aliveRoutes := make(map[uint]GatewayRoute)
-	var dbRoutes []GatewayRoute
-	if err := r.db.Where("id IN ?", routeOrder).Find(&dbRoutes).Error; err == nil {
-		for _, route := range dbRoutes {
-			aliveRoutes[route.ID] = route
-		}
-	}
-	channelIDs := make([]uint, 0)
-	groupIDs := make([]uint, 0)
-	seenChannel := make(map[uint]struct{})
-	seenGroup := make(map[uint]struct{})
-	for _, acc := range routes {
-		if acc.channelID > 0 {
-			if _, ok := seenChannel[acc.channelID]; !ok {
-				seenChannel[acc.channelID] = struct{}{}
-				channelIDs = append(channelIDs, acc.channelID)
-			}
-		}
-		if _, ok := seenGroup[acc.groupID]; !ok {
-			seenGroup[acc.groupID] = struct{}{}
-			groupIDs = append(groupIDs, acc.groupID)
-		}
-	}
-	channelNames := make(map[uint]string)
-	if len(channelIDs) > 0 {
-		var dbChannels []Channel
-		if err := r.db.Where("id IN ?", channelIDs).Find(&dbChannels).Error; err == nil {
-			for _, channel := range dbChannels {
-				channelNames[channel.ID] = channel.Name
-			}
-		}
-	}
 	groupNames := make(map[uint]string)
 	if len(groupIDs) > 0 {
 		var dbGroups []GatewayGroup
-		if err := r.db.Where("id IN ?", groupIDs).Find(&dbGroups).Error; err == nil {
+		if err := r.db.Where("id IN ?", keysOfUintSet(groupIDs)).Find(&dbGroups).Error; err == nil {
 			for _, group := range dbGroups {
 				groupNames[group.ID] = group.Name
 			}
 		}
 	}
-
-	grouped := make(map[uint]*GatewayDispatchAttentionGroup)
-	groupOrder := make([]uint, 0)
-	groupTTFT := make(map[uint][]float64)
-
-	for _, routeID := range routeOrder {
-		acc := routes[routeID]
-		item := GatewayDispatchAttentionRoute{
-			RouteID:           routeID,
-			GatewayGroupID:    acc.groupID,
-			SourceGroupName:   acc.srcGroup,
-			KeyName:           acc.keyName,
-			Requests:          len(acc.chains),
-			Attempts:          acc.attempts,
-			FailedAttempts:    acc.failed,
-			CurrentFailStreak: acc.curStreak,
-			MaxFailStreak:     acc.maxStreak,
-			Severity:          acc.severity,
-			Recent:            acc.recent,
-		}
-		// 来源优先用渠道名；provider 类路由没有渠道，退回 provider 名
-		if name, ok := channelNames[acc.channelID]; ok && name != "" {
-			item.SourceName = name
-		} else if acc.provider != "" {
-			item.SourceName = acc.provider
-		}
-		if route, ok := aliveRoutes[routeID]; ok {
-			item.Alive = true
-			item.Enabled = route.Enabled
-		}
-		if acc.attempts > 0 {
-			item.FailoverRate = float64(acc.failed) / float64(acc.attempts)
-		}
-		for chainKey := range acc.failedChains {
-			if chain := chains[chainKey]; chain != nil && chain.failovers > item.MaxFailoverDepth {
-				item.MaxFailoverDepth = chain.failovers
+	result.GatewayGroupName = groupNames[groupID]
+	if groupID > 0 && result.GatewayGroupName == "" {
+		result.GatewayGroupName = fmt.Sprintf("组 #%d", groupID)
+	}
+	channelNames := make(map[uint]string)
+	if len(channelIDs) > 0 {
+		var dbChannels []Channel
+		if err := r.db.Where("id IN ?", keysOfUintSet(channelIDs)).Find(&dbChannels).Error; err == nil {
+			for _, channel := range dbChannels {
+				channelNames[channel.ID] = channel.Name
 			}
 		}
-		if len(acc.ttft) > 0 {
-			sorted := append([]float64(nil), acc.ttft...)
-			sort.Float64s(sorted)
-			item.TTFTP95 = percentileFloat(sorted, 0.95)
-		}
-		topCount := 0
-		for message, count := range acc.errors {
-			if count > topCount || (count == topCount && message < item.TopError) {
-				item.TopError = message
-				topCount = count
+	}
+	aliveRoutes := make(map[uint]struct{})
+	if len(routeIDs) > 0 {
+		var dbRoutes []GatewayRoute
+		if err := r.db.Where("id IN ?", keysOfUintSet(routeIDs)).Find(&dbRoutes).Error; err == nil {
+			for _, route := range dbRoutes {
+				aliveRoutes[route.ID] = struct{}{}
 			}
 		}
-		item.Health = dispatchRouteHealth(item)
-
-		group := grouped[acc.groupID]
-		if group == nil {
-			name, ok := groupNames[acc.groupID]
-			if !ok {
-				name = fmt.Sprintf("组 #%d", acc.groupID)
-			}
-			group = &GatewayDispatchAttentionGroup{
-				GatewayGroupID:   acc.groupID,
-				GatewayGroupName: name,
-				Health:           "ok",
-				Routes:           []GatewayDispatchAttentionRoute{},
-			}
-			grouped[acc.groupID] = group
-			groupOrder = append(groupOrder, acc.groupID)
-		}
-		group.Routes = append(group.Routes, item)
-		group.Attempts += item.Attempts
-		group.FailedAttempts += item.FailedAttempts
-		group.Severity.P0 += item.Severity.P0
-		group.Severity.P1 += item.Severity.P1
-		group.Severity.P2 += item.Severity.P2
-		groupTTFT[acc.groupID] = append(groupTTFT[acc.groupID], acc.ttft...)
-		if item.Health != "ok" {
-			group.ProblemRoutes++
-		}
-		if dispatchHealthRank(item.Health) < dispatchHealthRank(group.Health) {
-			group.Health = item.Health
-		}
-
-		result.Routes++
-		if item.Health != "ok" {
-			result.ProblemRoutes++
-		}
-		result.Severity.P0 += item.Severity.P0
-		result.Severity.P1 += item.Severity.P1
-		result.Severity.P2 += item.Severity.P2
 	}
 
-	// 链级统计归到网关：一条链只算一次，不管它跨了几条路由
-	for _, chain := range chains {
-		group := grouped[chain.groupID]
-		if group == nil {
+	builder := newDispatchFlowBuilder()
+	outcomeDepth := 2
+	if groupID > 0 {
+		outcomeDepth = dispatchFlowMaxHops + 2
+	}
+	outcomeID := func(outcome string) string { return "o:" + outcome }
+	ensureOutcome := func(outcome string) string {
+		id := outcomeID(outcome)
+		builder.node(GatewayDispatchFlowNode{
+			ID: id, Label: dispatchOutcomeLabels[outcome], Kind: dispatchFlowNodeOutcome,
+			Depth: outcomeDepth, Outcome: outcome,
+		})
+		return id
+	}
+
+	if groupID == 0 {
+		// 全部网关：全部请求 → 各网关 → 三种结局
+		const rootID = "root"
+		builder.node(GatewayDispatchFlowNode{ID: rootID, Label: "全部请求", Kind: dispatchFlowNodeRoot, Depth: 0})
+		for _, key := range chainOrder {
+			chain := chains[key]
+			gatewayID := fmt.Sprintf("g:%d", chain.groupID)
+			name := groupNames[chain.groupID]
+			if name == "" {
+				name = fmt.Sprintf("组 #%d", chain.groupID)
+			}
+			builder.node(GatewayDispatchFlowNode{
+				ID: gatewayID, Label: name, Kind: dispatchFlowNodeGateway,
+				Depth: 1, GatewayGroupID: chain.groupID,
+			})
+			outcome := dispatchOutcomeOf(chain.attempts)
+			builder.link(rootID, gatewayID, false)
+			builder.link(gatewayID, ensureOutcome(outcome), outcome == dispatchOutcomeFailed)
+			if hops := len(chain.attempts); hops > result.MaxHops {
+				result.MaxHops = hops
+			}
+		}
+		result.Nodes, result.Links = builder.build()
+		return result, nil
+	}
+
+	// 单个网关：入口 → 第 1 跳路由 → 第 2 跳路由 → … → 结局
+	rootID := fmt.Sprintf("g:%d", groupID)
+	builder.node(GatewayDispatchFlowNode{
+		ID: rootID, Label: result.GatewayGroupName, Kind: dispatchFlowNodeGateway,
+		Depth: 0, GatewayGroupID: groupID,
+	})
+	overflowID := "h:more"
+	for _, key := range chainOrder {
+		chain := chains[key]
+		if hops := len(chain.attempts); hops > result.MaxHops {
+			result.MaxHops = hops
+		}
+		prev := rootID
+		prevIsRoot := true
+		overflowed := false
+		for index, attempt := range chain.attempts {
+			hop := index + 1
+			var nodeID string
+			if hop > dispatchFlowMaxHops {
+				if overflowed {
+					// 同一条链只在这里落一次，免得越深的链把边刷成自环般的重复计数
+					continue
+				}
+				overflowed = true
+				nodeID = overflowID
+				builder.node(GatewayDispatchFlowNode{
+					ID: overflowID, Label: fmt.Sprintf("第 %d 跳以后", dispatchFlowMaxHops+1),
+					Kind: dispatchFlowNodeOverflow, Depth: dispatchFlowMaxHops + 1,
+				})
+			} else {
+				nodeID = fmt.Sprintf("h%d:r%d", hop, attempt.routeID)
+				identity := identities[attempt.routeID]
+				label := fmt.Sprintf("路由 #%d", attempt.routeID)
+				if identity != nil {
+					label = identity.label(attempt.routeID, channelNames)
+				}
+				_, alive := aliveRoutes[attempt.routeID]
+				builder.node(GatewayDispatchFlowNode{
+					ID: nodeID, Label: label, Kind: dispatchFlowNodeRoute, Depth: hop,
+					GatewayGroupID: groupID, RouteID: attempt.routeID, Hop: hop, Alive: alive,
+				})
+			}
+			// 从路由节点连出去，只可能是因为这一跳失败了才转走的
+			builder.link(prev, nodeID, !prevIsRoot)
+			prev = nodeID
+			prevIsRoot = false
+		}
+		if prevIsRoot {
 			continue
 		}
-		group.Requests++
-		if chain.failovers > 0 {
-			group.FailoverRequests++
+		outcome := dispatchOutcomeOf(chain.attempts)
+		builder.link(prev, ensureOutcome(outcome), outcome == dispatchOutcomeFailed)
+	}
+	result.Nodes, result.Links = builder.build()
+	return result, nil
+}
+
+func keysOfUintSet(set map[uint]struct{}) []uint {
+	keys := make([]uint, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
+}
+
+// ---- 原始报错 ----
+//
+// 刻意不做任何加工：不归类、不合并、不截断 error_message。
+// 汇总视图（DispatchErrors）回答「错得多不多」，这里回答「到底报的什么」——
+// 排查时要的就是上游原话，任何提炼都可能把关键信息炼没了。
+
+type GatewayDispatchRawError struct {
+	ID          uint      `json:"id"`
+	Timestamp   time.Time `json:"timestamp"`
+	RequestID   string    `json:"request_id"`
+	Attempt     int       `json:"attempt"`
+	AttemptKind string    `json:"attempt_kind,omitempty"`
+
+	GatewayGroupID   uint   `json:"gateway_group_id"`
+	GatewayGroupName string `json:"gateway_group_name,omitempty"`
+	RouteID          uint   `json:"route_id"`
+	RouteLabel       string `json:"route_label,omitempty"`
+
+	Model      string `json:"model,omitempty"`
+	StatusCode int    `json:"status_code"`
+	ErrorType  string `json:"error_type,omitempty"`
+	DurationMS int64  `json:"duration_ms"`
+
+	Message         string `json:"message,omitempty"`
+	Detail          string `json:"detail,omitempty"`
+	UpstreamURL     string `json:"upstream_url,omitempty"`
+	UpstreamBody    string `json:"upstream_body,omitempty"`
+	UpstreamHeaders string `json:"upstream_headers,omitempty"`
+}
+
+type GatewayDispatchRawErrors struct {
+	From  time.Time                 `json:"from"`
+	To    time.Time                 `json:"to"`
+	Total int64                     `json:"total"`
+	Limit int                       `json:"limit"`
+	Items []GatewayDispatchRawError `json:"items"`
+}
+
+const (
+	dispatchRawErrorDefaultLimit = 50
+	dispatchRawErrorMaxLimit     = 200
+)
+
+// DispatchRawErrors 返回窗口内最近的失败尝试原文，新的在前。
+// groupID / routeID 为 0 表示不过滤。注意 upstream_body 可能到几十 KB，
+// 所以默认只取 50 条——限制的是条数，不是每条的内容。
+func (r *GatewayUsageLogs) DispatchRawErrors(from, to time.Time, groupID, routeID uint, limit int) (GatewayDispatchRawErrors, error) {
+	if from.IsZero() || to.IsZero() || !to.After(from) {
+		return GatewayDispatchRawErrors{}, fmt.Errorf("invalid dispatch raw error range")
+	}
+	if limit <= 0 {
+		limit = dispatchRawErrorDefaultLimit
+	}
+	if limit > dispatchRawErrorMaxLimit {
+		limit = dispatchRawErrorMaxLimit
+	}
+	result := GatewayDispatchRawErrors{From: from, To: to, Limit: limit, Items: []GatewayDispatchRawError{}}
+
+	scope := func() *gorm.DB {
+		query := r.db.Model(&GatewayUsageLog{}).Where("success = ?", false)
+		if isSQLite(r.db) {
+			query = query.Where("CAST(strftime('%s', created_at) AS INTEGER) >= ? AND CAST(strftime('%s', created_at) AS INTEGER) < ?", from.Unix(), to.Unix())
+		} else {
+			query = query.Where("created_at >= ? AND created_at < ?", from, to)
 		}
-		if chain.lastFailed {
-			group.FailedRequests++
+		if groupID > 0 {
+			query = query.Where("gateway_group_id = ?", groupID)
+		}
+		if routeID > 0 {
+			query = query.Where("route_id = ?", routeID)
+		}
+		return query
+	}
+
+	if err := scope().Count(&result.Total).Error; err != nil {
+		return GatewayDispatchRawErrors{}, err
+	}
+	var logs []GatewayUsageLog
+	if err := scope().Order("created_at DESC, id DESC").Limit(limit).Find(&logs).Error; err != nil {
+		return GatewayDispatchRawErrors{}, err
+	}
+	if len(logs) == 0 {
+		return result, nil
+	}
+
+	groupIDs := make(map[uint]struct{})
+	channelIDs := make(map[uint]struct{})
+	identities := make(map[uint]*dispatchRouteIdentity)
+	for _, log := range logs {
+		groupIDs[log.GatewayGroupID] = struct{}{}
+		if log.ChannelID > 0 {
+			channelIDs[log.ChannelID] = struct{}{}
+		}
+		identity := identities[log.RouteID]
+		if identity == nil {
+			identity = &dispatchRouteIdentity{}
+			identities[log.RouteID] = identity
+		}
+		identity.absorb(log)
+	}
+	groupNames := make(map[uint]string)
+	if len(groupIDs) > 0 {
+		var dbGroups []GatewayGroup
+		if err := r.db.Where("id IN ?", keysOfUintSet(groupIDs)).Find(&dbGroups).Error; err == nil {
+			for _, group := range dbGroups {
+				groupNames[group.ID] = group.Name
+			}
+		}
+	}
+	channelNames := make(map[uint]string)
+	if len(channelIDs) > 0 {
+		var dbChannels []Channel
+		if err := r.db.Where("id IN ?", keysOfUintSet(channelIDs)).Find(&dbChannels).Error; err == nil {
+			for _, channel := range dbChannels {
+				channelNames[channel.ID] = channel.Name
+			}
 		}
 	}
 
-	for _, groupID := range groupOrder {
-		group := grouped[groupID]
-		if group.Requests > 0 {
-			group.RequestFailoverRate = float64(group.FailoverRequests) / float64(group.Requests)
+	for _, log := range logs {
+		item := GatewayDispatchRawError{
+			ID: log.ID, Timestamp: log.CreatedAt, RequestID: log.RequestID,
+			Attempt: log.Attempt, AttemptKind: log.AttemptKind,
+			GatewayGroupID: log.GatewayGroupID, GatewayGroupName: groupNames[log.GatewayGroupID],
+			RouteID: log.RouteID, Model: log.RequestedModel,
+			StatusCode: log.StatusCode, ErrorType: log.ErrorType, DurationMS: log.DurationMS,
+			Message: log.ErrorMessage, Detail: log.ErrorDetail,
+			UpstreamURL: log.UpstreamURL, UpstreamBody: log.UpstreamErrorBody,
+			UpstreamHeaders: log.UpstreamErrorHeaders,
 		}
-		if values := groupTTFT[groupID]; len(values) > 0 {
-			sort.Float64s(values)
-			group.TTFTP95 = percentileFloat(values, 0.95)
+		if item.GatewayGroupName == "" {
+			item.GatewayGroupName = fmt.Sprintf("组 #%d", log.GatewayGroupID)
 		}
-		// 组内也是「最该处理排前面」：先看档位，再看要人工介入的量（P0），
-		// 然后才是「正在连败」和顺延率。P0 排在连败前面，是因为末尾偶然失败一次
-		// 也算连败 1，拿它当第一排序键会把噪声顶到最上面。
-		sort.Slice(group.Routes, func(i, j int) bool {
-			a, b := group.Routes[i], group.Routes[j]
-			if ra, rb := dispatchHealthRank(a.Health), dispatchHealthRank(b.Health); ra != rb {
-				return ra < rb
-			}
-			if a.Severity.P0 != b.Severity.P0 {
-				return a.Severity.P0 > b.Severity.P0
-			}
-			if a.CurrentFailStreak != b.CurrentFailStreak {
-				return a.CurrentFailStreak > b.CurrentFailStreak
-			}
-			if a.FailoverRate != b.FailoverRate {
-				return a.FailoverRate > b.FailoverRate
-			}
-			if a.FailedAttempts != b.FailedAttempts {
-				return a.FailedAttempts > b.FailedAttempts
-			}
-			return a.RouteID < b.RouteID
-		})
-		result.Groups = append(result.Groups, *group)
+		if identity := identities[log.RouteID]; identity != nil {
+			item.RouteLabel = identity.label(log.RouteID, channelNames)
+		}
+		result.Items = append(result.Items, item)
 	}
-
-	// 「最该处理」的网关排前面
-	sort.Slice(result.Groups, func(i, j int) bool {
-		a, b := result.Groups[i], result.Groups[j]
-		if ra, rb := dispatchHealthRank(a.Health), dispatchHealthRank(b.Health); ra != rb {
-			return ra < rb
-		}
-		if a.Severity.P0 != b.Severity.P0 {
-			return a.Severity.P0 > b.Severity.P0
-		}
-		if a.RequestFailoverRate != b.RequestFailoverRate {
-			return a.RequestFailoverRate > b.RequestFailoverRate
-		}
-		if a.ProblemRoutes != b.ProblemRoutes {
-			return a.ProblemRoutes > b.ProblemRoutes
-		}
-		return a.GatewayGroupID < b.GatewayGroupID
-	})
 	return result, nil
 }
 

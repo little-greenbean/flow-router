@@ -1,9 +1,10 @@
 package storage
 
 import (
+	"fmt"
 	"math"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1357,198 +1358,277 @@ func TestGatewayUsageDispatchErrorsRejectsBadRange(t *testing.T) {
 	}
 }
 
-func TestGatewayUsageDispatchAttentionGroupsByGateway(t *testing.T) {
+// dispatchFlowFixture 造一份可复用的调度记录：
+//
+//	fl-1 路由 11 直接成功
+//	fl-2 路由 11 失败 → 顺延路由 12 成功
+//	fl-3 路由 11 失败 → 路由 12 失败 → 最终失败
+//	fl-4 另一个网关（32）里路由 21 直接成功
+func dispatchFlowFixture(t *testing.T) (*GatewayUsageLogs, time.Time, time.Time) {
+	t.Helper()
 	db := openTestDB(t)
 	usage := NewGatewayUsageLogs(db)
-	if err := db.Create(&GatewayGroup{ID: 31, Name: "建议关注网关"}).Error; err != nil {
+	if err := db.Create(&GatewayGroup{ID: 31, Name: "主网关"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&GatewayGroup{ID: 32, Name: "备网关"}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Create(&Channel{ID: 7, Name: "渠道七", Type: ChannelTypeNewAPI, SiteURL: "https://x", Username: "u"}).Error; err != nil {
 		t.Fatal(err)
 	}
-	// 路由 11 还活着且启用；路由 12 已被删除（只剩历史日志）
+	// 路由 11 还在，路由 12 已删除（只剩历史日志）
 	if err := db.Create(&GatewayRoute{ID: 11, GatewayGroupID: 31, Position: 0, SourceChannelID: 7, Enabled: true}).Error; err != nil {
 		t.Fatal(err)
 	}
 	from := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
 	to := from.Add(10 * time.Minute)
-	ttft := func(ms int64) *int64 { return &ms }
 	rows := []GatewayUsageLog{
-		// sc-1：路由 11 因 403 失败（P0，需人工），顺延到路由 12 成功 → 链顺延 1 次、最终成功
-		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceGroupName: "源组A", SourceAPIKeyName: "uops-key-a", RequestID: "sc-1", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 403, ErrorMessage: "余额不足", CreatedAt: from.Add(10 * time.Second)},
-		{GatewayGroupID: 31, RouteID: 12, ProviderName: "供应商B", SourceGroupName: "源组B", SourceAPIKeyName: "uops-key-b", RequestID: "sc-1", Attempt: 2, AttemptKind: "failover", Success: true, FirstTokenMS: ttft(800), CreatedAt: from.Add(11 * time.Second)},
-		// sc-2：路由 11 再次 403 → 顺延两次才成功，链顺延 2 次
-		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceAPIKeyName: "uops-key-a", RequestID: "sc-2", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 403, ErrorMessage: "余额不足", CreatedAt: from.Add(1 * time.Minute)},
-		{GatewayGroupID: 31, RouteID: 12, RequestID: "sc-2", Attempt: 2, AttemptKind: "failover", Success: false, ErrorType: "http", StatusCode: 502, ErrorMessage: "网关错误", CreatedAt: from.Add(61 * time.Second)},
-		{GatewayGroupID: 31, RouteID: 12, RequestID: "sc-2", Attempt: 3, AttemptKind: "failover", Success: true, FirstTokenMS: ttft(1200), CreatedAt: from.Add(62 * time.Second)},
-		// sc-3：路由 11 成功一次 → 打断连败
-		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, RequestID: "sc-3", Attempt: 1, Success: true, FirstTokenMS: ttft(400), CreatedAt: from.Add(2 * time.Minute)},
-		// sc-4：路由 12 被客户端断开（P2，噪声），且这条链没顺延、最终失败
-		{GatewayGroupID: 31, RouteID: 12, RequestID: "sc-4", Attempt: 1, Success: false, ErrorType: "client", StatusCode: 499, ErrorMessage: "客户端断开", CreatedAt: from.Add(3 * time.Minute)},
+		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceGroupName: "源组A", RequestID: "fl-1", Attempt: 1, Success: true, CreatedAt: from.Add(1 * time.Second)},
+		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceGroupName: "源组A", RequestID: "fl-2", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 403, ErrorMessage: "余额不足", CreatedAt: from.Add(2 * time.Second)},
+		{GatewayGroupID: 31, RouteID: 12, ProviderName: "供应商B", RequestID: "fl-2", Attempt: 2, AttemptKind: "failover", Success: true, CreatedAt: from.Add(3 * time.Second)},
+		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, RequestID: "fl-3", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 403, ErrorMessage: "余额不足", CreatedAt: from.Add(4 * time.Second)},
+		{GatewayGroupID: 31, RouteID: 12, ProviderName: "供应商B", RequestID: "fl-3", Attempt: 2, AttemptKind: "failover", Success: false, ErrorType: "http", StatusCode: 502, ErrorMessage: "网关错误", CreatedAt: from.Add(5 * time.Second)},
+		{GatewayGroupID: 32, RouteID: 21, RequestID: "fl-4", Attempt: 1, Success: true, CreatedAt: from.Add(6 * time.Second)},
 	}
 	for i := range rows {
 		if err := usage.Create(&rows[i]); err != nil {
 			t.Fatal(err)
 		}
 	}
+	return usage, from, to
+}
 
-	got, err := usage.DispatchAttention(from, to)
+func flowLink(t *testing.T, flow GatewayDispatchFlow, source, target string) GatewayDispatchFlowLink {
+	t.Helper()
+	for _, link := range flow.Links {
+		if link.Source == source && link.Target == target {
+			return link
+		}
+	}
+	t.Fatalf("link %s -> %s not found in %+v", source, target, flow.Links)
+	return GatewayDispatchFlowLink{}
+}
+
+func flowNode(t *testing.T, flow GatewayDispatchFlow, id string) GatewayDispatchFlowNode {
+	t.Helper()
+	for _, node := range flow.Nodes {
+		if node.ID == id {
+			return node
+		}
+	}
+	t.Fatalf("node %s not found", id)
+	return GatewayDispatchFlowNode{}
+}
+
+func TestGatewayUsageDispatchFlowSplitsByGateway(t *testing.T) {
+	usage, from, to := dispatchFlowFixture(t)
+	flow, err := usage.DispatchFlow(from, to, 0)
 	if err != nil {
-		t.Fatalf("dispatch attention: %v", err)
+		t.Fatalf("dispatch flow: %v", err)
 	}
-	if len(got.Groups) != 1 {
-		t.Fatalf("groups = %d, want 1", len(got.Groups))
+	if flow.Scope != "all" {
+		t.Fatalf("scope = %q, want all", flow.Scope)
 	}
-	group := got.Groups[0]
-	if group.GatewayGroupID != 31 || group.GatewayGroupName != "建议关注网关" {
-		t.Fatalf("group = %d/%q, want 31/建议关注网关", group.GatewayGroupID, group.GatewayGroupName)
+	// 4 条链、6 次尝试：链级和尝试级是两个口径，别混
+	if flow.Requests != 4 || flow.Attempts != 6 {
+		t.Fatalf("requests/attempts = %d/%d, want 4/6", flow.Requests, flow.Attempts)
 	}
-	// 链级：4 条请求，其中 sc-1/sc-2 顺延过，sc-4 最终失败
-	if group.Requests != 4 || group.FailoverRequests != 2 || group.FailedRequests != 1 {
-		t.Fatalf("group chains = %d/%d/%d, want 4/2/1", group.Requests, group.FailoverRequests, group.FailedRequests)
+	if flow.MaxHops != 2 {
+		t.Fatalf("max hops = %d, want 2", flow.MaxHops)
 	}
-	if math.Abs(group.RequestFailoverRate-0.5) > 1e-9 {
-		t.Fatalf("group request failover rate = %v, want 0.5", group.RequestFailoverRate)
+	if link := flowLink(t, flow, "root", "g:31"); link.Value != 3 {
+		t.Fatalf("root -> g:31 = %d, want 3", link.Value)
 	}
-	// 尝试级仍然按尝试算，别跟链级混
-	if group.Attempts != 7 || group.FailedAttempts != 4 {
-		t.Fatalf("group attempts = %d/%d, want 7/4", group.Attempts, group.FailedAttempts)
+	if link := flowLink(t, flow, "root", "g:32"); link.Value != 1 {
+		t.Fatalf("root -> g:32 = %d, want 1", link.Value)
 	}
-	if group.Severity.P0 != 2 || group.Severity.P1 != 1 || group.Severity.P2 != 1 {
-		t.Fatalf("group severity = %+v, want P0=2/P1=1/P2=1", group.Severity)
+	// fl-1 一次过、fl-2 顺延后成功、fl-3 最终失败
+	if link := flowLink(t, flow, "g:31", "o:direct"); link.Value != 1 || link.Failed {
+		t.Fatalf("g:31 -> direct = %+v, want value 1 / failed false", link)
 	}
-	// 网关健康取组内最差的路由
-	if group.Health != "action" {
-		t.Fatalf("group health = %q, want action", group.Health)
+	if link := flowLink(t, flow, "g:31", "o:recovered"); link.Value != 1 {
+		t.Fatalf("g:31 -> recovered = %d, want 1", link.Value)
 	}
-	if len(group.Routes) != 2 {
-		t.Fatalf("routes = %d, want 2", len(group.Routes))
+	if link := flowLink(t, flow, "g:31", "o:failed"); link.Value != 1 || !link.Failed {
+		t.Fatalf("g:31 -> failed = %+v, want value 1 / failed true", link)
 	}
-
-	// P0 多的排前面 → 路由 11
-	first := group.Routes[0]
-	if first.RouteID != 11 {
-		t.Fatalf("first route = %d, want 11", first.RouteID)
+	if node := flowNode(t, flow, "g:31"); node.Value != 3 || node.Label != "主网关" || node.Depth != 1 {
+		t.Fatalf("g:31 node = %+v", node)
 	}
-	if first.Severity.P0 != 2 || first.Severity.P1 != 0 || first.Severity.P2 != 0 {
-		t.Fatalf("route 11 severity = %+v, want P0=2", first.Severity)
-	}
-	if first.Attempts != 3 || first.FailedAttempts != 2 {
-		t.Fatalf("route 11 attempts = %d/%d, want 3/2", first.Attempts, first.FailedAttempts)
-	}
-	if math.Abs(first.FailoverRate-2.0/3.0) > 1e-9 {
-		t.Fatalf("route 11 failover rate = %v, want 2/3", first.FailoverRate)
-	}
-	// 路由 11 失败所在的链最深顺延 2 次（sc-2）
-	if first.MaxFailoverDepth != 2 {
-		t.Fatalf("route 11 max failover depth = %d, want 2", first.MaxFailoverDepth)
-	}
-	// 连败按「这条路由自己的尝试序列」算，中间夹着别的路由不算打断：
-	// 路由 11 是 败-败-成 → 最长 2，末尾是成功 → 当前 0
-	if first.MaxFailStreak != 2 || first.CurrentFailStreak != 0 {
-		t.Fatalf("route 11 streak = %d/%d, want max 2 / current 0", first.MaxFailStreak, first.CurrentFailStreak)
-	}
-	// 身份：来源取渠道名，源分组取日志快照，而不是密钥名
-	if first.SourceName != "渠道七" || first.SourceGroupName != "源组A" {
-		t.Fatalf("route 11 identity = %q / %q, want 渠道七 / 源组A", first.SourceName, first.SourceGroupName)
-	}
-	if first.KeyName != "uops-key-a" {
-		t.Fatalf("route 11 key name = %q, want uops-key-a", first.KeyName)
-	}
-	if !first.Alive || !first.Enabled {
-		t.Fatalf("route 11 alive/enabled = %v/%v, want true/true", first.Alive, first.Enabled)
-	}
-	if first.TopError != "余额不足" {
-		t.Fatalf("route 11 top error = %q, want 余额不足", first.TopError)
-	}
-	if first.Requests != 3 {
-		t.Fatalf("route 11 requests = %d, want 3", first.Requests)
-	}
-	// 最近请求状态按时间正序，成功那次在最后
-	if len(first.Recent) != 3 {
-		t.Fatalf("route 11 recent = %d, want 3", len(first.Recent))
-	}
-	if !first.Recent[2].Success || first.Recent[2].Severity != -1 {
-		t.Fatalf("route 11 last mark = %+v, want success", first.Recent[2])
-	}
-	if first.Recent[0].Success || first.Recent[0].Severity != dispatchSeverityP0 || first.Recent[0].StatusCode != 403 {
-		t.Fatalf("route 11 first mark = %+v, want failed P0 403", first.Recent[0])
-	}
-
-	second := group.Routes[1]
-	if second.RouteID != 12 {
-		t.Fatalf("second route = %d, want 12", second.RouteID)
-	}
-	// 502 归 P1，客户端断开归 P2
-	if second.Severity.P0 != 0 || second.Severity.P1 != 1 || second.Severity.P2 != 1 {
-		t.Fatalf("route 12 severity = %+v, want P0=0/P1=1/P2=1", second.Severity)
-	}
-	// 路由 12 已删除 → alive=false，前端不给跳转
-	if second.Alive {
-		t.Fatalf("route 12 alive = true, want false (已删除)")
-	}
-	// provider 类路由没有渠道，来源退回 provider 名
-	if second.SourceName != "供应商B" {
-		t.Fatalf("route 12 source = %q, want 供应商B", second.SourceName)
-	}
-	// TTFT P95 取该路由所有有首字耗时的尝试
-	if second.TTFTP95 < 1200 {
-		t.Fatalf("route 12 ttft p95 = %v, want >=1200", second.TTFTP95)
-	}
-	// 窗口末尾那次是失败（sc-4 客户端断开）→ 当前连败 1
-	if second.CurrentFailStreak != 1 {
-		t.Fatalf("route 12 current fail streak = %d, want 1", second.CurrentFailStreak)
-	}
-
-	if got.Routes != 2 || got.ProblemRoutes != group.ProblemRoutes {
-		t.Fatalf("totals = %d routes / %d problem, group problem = %d", got.Routes, got.ProblemRoutes, group.ProblemRoutes)
-	}
-	if got.Severity.P0 != 2 {
-		t.Fatalf("total severity = %+v, want P0=2", got.Severity)
+	// 根节点没有入边，权重要按出边算，否则画出来是 0 宽
+	if node := flowNode(t, flow, "root"); node.Value != 4 {
+		t.Fatalf("root value = %d, want 4", node.Value)
 	}
 }
 
-func TestGatewayUsageDispatchAttentionKeepsOnlyRecentAttempts(t *testing.T) {
+func TestGatewayUsageDispatchFlowDrillsIntoRoutesByHop(t *testing.T) {
+	usage, from, to := dispatchFlowFixture(t)
+	flow, err := usage.DispatchFlow(from, to, 31)
+	if err != nil {
+		t.Fatalf("dispatch flow: %v", err)
+	}
+	if flow.Scope != "gateway" || flow.GatewayGroupName != "主网关" {
+		t.Fatalf("scope = %q / %q", flow.Scope, flow.GatewayGroupName)
+	}
+	// 只算该网关的链，另一个网关的 fl-4 不该混进来
+	if flow.Requests != 3 {
+		t.Fatalf("requests = %d, want 3", flow.Requests)
+	}
+	// 三条链都从路由 11 起跳
+	if link := flowLink(t, flow, "g:31", "h1:r11"); link.Value != 3 || link.Failed {
+		t.Fatalf("entry -> h1:r11 = %+v, want value 3 / failed false", link)
+	}
+	// 路由 11 失败两次，都顺延到路由 12；这条边必须标成 failed
+	if link := flowLink(t, flow, "h1:r11", "h2:r12"); link.Value != 2 || !link.Failed {
+		t.Fatalf("h1:r11 -> h2:r12 = %+v, want value 2 / failed true", link)
+	}
+	if link := flowLink(t, flow, "h1:r11", "o:direct"); link.Value != 1 {
+		t.Fatalf("h1:r11 -> direct = %d, want 1", link.Value)
+	}
+	if link := flowLink(t, flow, "h2:r12", "o:recovered"); link.Value != 1 {
+		t.Fatalf("h2:r12 -> recovered = %d, want 1", link.Value)
+	}
+	if link := flowLink(t, flow, "h2:r12", "o:failed"); link.Value != 1 || !link.Failed {
+		t.Fatalf("h2:r12 -> failed = %+v", link)
+	}
+	// 身份用来源 · 源分组，不用密钥名；provider 类路由退回 provider 名
+	first := flowNode(t, flow, "h1:r11")
+	if first.Label != "渠道七 · 源组A" || first.Hop != 1 || !first.Alive {
+		t.Fatalf("h1:r11 node = %+v", first)
+	}
+	second := flowNode(t, flow, "h2:r12")
+	if second.Label != "供应商B" || second.Hop != 2 {
+		t.Fatalf("h2:r12 node = %+v", second)
+	}
+	// 路由 12 已删除 → alive=false，前端不给跳转
+	if second.Alive {
+		t.Fatalf("h2:r12 alive = true, want false (已删除)")
+	}
+	// 同一条路由出现在不同跳必须是不同节点，否则桑基图会成环画不出来
+	if first.RouteID != 11 || second.RouteID != 12 {
+		t.Fatalf("route ids = %d/%d", first.RouteID, second.RouteID)
+	}
+}
+
+func TestGatewayUsageDispatchFlowCollapsesDeepChains(t *testing.T) {
 	db := openTestDB(t)
 	usage := NewGatewayUsageLogs(db)
 	from := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
 	to := from.Add(time.Hour)
-	total := dispatchRecentAttempts + 5
-	for i := 0; i < total; i++ {
+	// 一条链连着顺延 8 跳，超过 dispatchFlowMaxHops
+	hops := dispatchFlowMaxHops + 3
+	for i := 0; i < hops; i++ {
 		row := GatewayUsageLog{
-			GatewayGroupID: 41, RouteID: 21, RequestID: "r-" + strconv.Itoa(i), Attempt: 1,
-			Success: true, CreatedAt: from.Add(time.Duration(i) * time.Second),
+			GatewayGroupID: 41, RouteID: uint(100 + i), RequestID: "deep", Attempt: i + 1,
+			Success: i == hops-1, CreatedAt: from.Add(time.Duration(i) * time.Second),
+		}
+		if i > 0 {
+			row.AttemptKind = "failover"
 		}
 		if err := usage.Create(&row); err != nil {
 			t.Fatal(err)
 		}
 	}
-	got, err := usage.DispatchAttention(from, to)
+	flow, err := usage.DispatchFlow(from, to, 41)
 	if err != nil {
 		t.Fatal(err)
 	}
-	route := got.Groups[0].Routes[0]
-	if route.Attempts != total {
-		t.Fatalf("attempts = %d, want %d", route.Attempts, total)
+	if flow.MaxHops != hops {
+		t.Fatalf("max hops = %d, want %d (实际深度要如实报出来)", flow.MaxHops, hops)
 	}
-	// 统计不截断，只有展示用的 Recent 截断，且留的是最新的那批
-	if len(route.Recent) != dispatchRecentAttempts {
-		t.Fatalf("recent = %d, want %d", len(route.Recent), dispatchRecentAttempts)
+	// 超过上限的那几跳收进一个节点，而且同一条链只落一次——否则会重复计数
+	if link := flowLink(t, flow, fmt.Sprintf("h%d:r%d", dispatchFlowMaxHops, 100+dispatchFlowMaxHops-1), "h:more"); link.Value != 1 {
+		t.Fatalf("overflow link = %d, want 1", link.Value)
 	}
-	if !route.Recent[len(route.Recent)-1].Timestamp.Equal(from.Add(time.Duration(total-1) * time.Second)) {
-		t.Fatalf("recent tail = %v, want the newest attempt", route.Recent[len(route.Recent)-1].Timestamp)
+	if node := flowNode(t, flow, "h:more"); node.Value != 1 || node.Kind != dispatchFlowNodeOverflow {
+		t.Fatalf("overflow node = %+v", node)
+	}
+	if link := flowLink(t, flow, "h:more", "o:recovered"); link.Value != 1 {
+		t.Fatalf("overflow -> recovered = %d, want 1", link.Value)
+	}
+	for _, node := range flow.Nodes {
+		if node.Hop > dispatchFlowMaxHops {
+			t.Fatalf("node %s 的 hop=%d 超过上限，应该收进 h:more", node.ID, node.Hop)
+		}
 	}
 }
 
-func TestGatewayUsageDispatchAttentionRejectsBadRange(t *testing.T) {
+func TestGatewayUsageDispatchFlowRejectsBadRange(t *testing.T) {
 	db := openTestDB(t)
 	usage := NewGatewayUsageLogs(db)
 	now := time.Now().UTC()
-	if _, err := usage.DispatchAttention(now, now); err == nil {
+	if _, err := usage.DispatchFlow(now, now, 0); err == nil {
 		t.Fatal("zero-duration range should fail")
 	}
-	if _, err := usage.DispatchAttention(time.Time{}, now); err == nil {
+	if _, err := usage.DispatchFlow(time.Time{}, now, 0); err == nil {
 		t.Fatal("zero from should fail")
+	}
+}
+
+func TestGatewayUsageDispatchRawErrorsKeepsMessagesVerbatim(t *testing.T) {
+	usage, from, to := dispatchFlowFixture(t)
+	// 一条超长且带换行的上游原文：这里的重点就是「不加工」
+	long := strings.Repeat("上游原始报错 ", 200) + "\n<html>502 Bad Gateway</html>"
+	row := GatewayUsageLog{
+		GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceGroupName: "源组A",
+		RequestID: "raw-1", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 502,
+		RequestedModel: "gpt-5.6", ErrorMessage: long, ErrorDetail: "detail-原文",
+		UpstreamErrorBody: "<html>body</html>", UpstreamURL: "https://up/v1/messages",
+		CreatedAt: from.Add(9 * time.Minute),
+	}
+	if err := usage.Create(&row); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := usage.DispatchRawErrors(from, to, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("raw errors: %v", err)
+	}
+	// 窗口内失败尝试：fl-2 的 403、fl-3 的 403 与 502，加上刚写的这条
+	if got.Total != 4 {
+		t.Fatalf("total = %d, want 4", got.Total)
+	}
+	if got.Limit != dispatchRawErrorDefaultLimit {
+		t.Fatalf("limit = %d, want default %d", got.Limit, dispatchRawErrorDefaultLimit)
+	}
+	if len(got.Items) != 4 {
+		t.Fatalf("items = %d, want 4", len(got.Items))
+	}
+	// 新的在前
+	first := got.Items[0]
+	if first.RequestID != "raw-1" {
+		t.Fatalf("first item = %q, want raw-1 (最新的排最前)", first.RequestID)
+	}
+	if first.Message != long {
+		t.Fatalf("message 被改动了：len=%d want %d", len([]rune(first.Message)), len([]rune(long)))
+	}
+	if first.Detail != "detail-原文" || first.UpstreamBody != "<html>body</html>" || first.UpstreamURL != "https://up/v1/messages" {
+		t.Fatalf("raw fields = %+v", first)
+	}
+	if first.RouteLabel != "渠道七 · 源组A" || first.GatewayGroupName != "主网关" || first.Model != "gpt-5.6" {
+		t.Fatalf("identity = %+v", first)
+	}
+
+	// 按网关 + 路由过滤
+	scoped, err := usage.DispatchRawErrors(from, to, 31, 12, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scoped.Total != 1 || len(scoped.Items) != 1 || scoped.Items[0].RouteID != 12 {
+		t.Fatalf("scoped = %d/%d", scoped.Total, len(scoped.Items))
+	}
+
+	// limit 只限条数，Total 仍然是窗口内的全量，否则「还有多少没看」就丢了
+	limited, err := usage.DispatchRawErrors(from, to, 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limited.Total != 4 || len(limited.Items) != 2 {
+		t.Fatalf("limited = total %d / items %d, want 4/2", limited.Total, len(limited.Items))
+	}
+	if capped, err := usage.DispatchRawErrors(from, to, 0, 0, 10_000); err != nil || capped.Limit != dispatchRawErrorMaxLimit {
+		t.Fatalf("limit 应被夹到 %d，实际 %d (err=%v)", dispatchRawErrorMaxLimit, capped.Limit, err)
 	}
 }
 
@@ -1572,39 +1652,6 @@ func TestDispatchSeverityClassifiesByUrgency(t *testing.T) {
 	for _, tc := range cases {
 		if got := dispatchSeverityOf(tc.log); got != tc.want {
 			t.Errorf("%s: severity = %d, want %d", tc.name, got, tc.want)
-		}
-	}
-}
-
-func TestDispatchRouteHealthUsesP0RateAndFailStreak(t *testing.T) {
-	sev := func(p0, p1, p2 int) GatewayDispatchSeverityCounts {
-		return GatewayDispatchSeverityCounts{P0: p0, P1: p1, P2: p2}
-	}
-	cases := []struct {
-		name  string
-		route GatewayDispatchAttentionRoute
-		want  string
-	}{
-		// 370 次尝试里 1 次 P0（0.27%）：值得看一眼，但不该跟大面积 P0 同级
-		{"偶发 P0 只算关注", GatewayDispatchAttentionRoute{Attempts: 370, Severity: sev(1, 0, 0)}, "watch"},
-		// 370 次里 6 次 P0（1.6%）：够格了
-		{"P0 占比过线算需处理", GatewayDispatchAttentionRoute{Attempts: 370, Severity: sev(6, 0, 0)}, "action"},
-		{"顺延率过半算需处理", GatewayDispatchAttentionRoute{Attempts: 100, FailoverRate: 0.5}, "action"},
-		{"顺延率双位数算关注", GatewayDispatchAttentionRoute{Attempts: 100, FailoverRate: 0.1}, "watch"},
-		{"首字过慢算关注", GatewayDispatchAttentionRoute{Attempts: 100, TTFTP95: 10_001}, "watch"},
-		// 连败是「正在挂」的信号：20% 失败率散着出现是抖动，末尾连着 5 次就是挂了
-		{"末尾连败到线算需处理", GatewayDispatchAttentionRoute{Attempts: 100, CurrentFailStreak: 5}, "action"},
-		{"末尾连败三次算关注", GatewayDispatchAttentionRoute{Attempts: 100, CurrentFailStreak: 3}, "watch"},
-		// 历史上连败过但现在恢复了，不该继续标红
-		{"连败已恢复不标红", GatewayDispatchAttentionRoute{Attempts: 100, MaxFailStreak: 9, CurrentFailStreak: 0}, "ok"},
-		{"干净路由是健康", GatewayDispatchAttentionRoute{Attempts: 100, FailoverRate: 0.05, TTFTP95: 900}, "ok"},
-		// P1/P2 再多也不该把整体健康的路由标红，否则标记会失去意义
-		{"只有抖动和噪声不升级", GatewayDispatchAttentionRoute{Attempts: 100, Severity: sev(0, 40, 40)}, "ok"},
-		{"零尝试不该除零", GatewayDispatchAttentionRoute{Attempts: 0, Severity: sev(0, 0, 0)}, "ok"},
-	}
-	for _, tc := range cases {
-		if got := dispatchRouteHealth(tc.route); got != tc.want {
-			t.Errorf("%s: health = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }

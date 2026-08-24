@@ -974,78 +974,76 @@ export interface GatewayDispatchSeverityCounts {
 
 export type DispatchHealth = "action" | "watch" | "ok"
 
-/** 「最近请求状态」里的一格。 */
-export interface GatewayDispatchAttempt {
-  timestamp: string
-  success: boolean
-  /** 失败时是 0/1/2 对应 P0/P1/P2；成功时是 -1 */
-  severity: number
-  status_code?: number
-  /** primary | retry | failover */
-  attempt_kind?: string
-  model?: string
-  first_token_ms?: number
-  message?: string
+/** 桑基图的一个节点。name 用 id 保证唯一（同一条路由在不同跳是不同节点，否则会成环）。 */
+export interface GatewayDispatchFlowNode {
+  id: string
+  label: string
+  /** root | gateway | route | overflow | outcome */
+  kind: string
+  depth: number
+  value: number
+  gateway_group_id?: number
+  route_id?: number
+  /** 路由节点在第几跳，1 = 首发 */
+  hop?: number
+  /** false = 路由已删除，只剩历史日志，不提供跳转 */
+  alive?: boolean
+  /** 终点节点的结局：direct | recovered | failed */
+  outcome?: string
 }
 
-/** 建议关注里的一条路由：回答「这条路由该不该禁掉」。 */
-export interface GatewayDispatchAttentionRoute {
-  route_id: number
-  gateway_group_id: number
-  /** 来源：渠道名，或 provider 路由的 provider 名 */
-  source_name?: string
-  /** 源分组 */
-  source_group_name?: string
-  /** 密钥名，仅在来源和源分组都为空时兜底显示 */
-  key_name?: string
-  /** false = 路由已被删除，只剩历史日志，不提供跳转 */
-  alive: boolean
-  enabled: boolean
-  requests: number
-  attempts: number
-  failed_attempts: number
-  failover_rate: number
-  /** 该路由失败所在的请求链里，顺延次数最多的那条链顺延了几次 */
-  max_failover_depth: number
-  /** 窗口末尾还连着败几次（正在坏） */
-  current_fail_streak: number
-  /** 窗口内最长的一段连败（坏得最狠时有多狠） */
-  max_fail_streak: number
-  ttft_p95: number
-  severity: GatewayDispatchSeverityCounts
-  top_error?: string
-  /** 健康档位由后端判定（见 dispatchRouteHealth），排序也按它，两者永远一致 */
-  health: DispatchHealth
-  /** 最近若干次尝试，时间正序（左旧右新） */
-  recent: GatewayDispatchAttempt[]
+export interface GatewayDispatchFlowLink {
+  source: string
+  target: string
+  value: number
+  /** true = 这股流量是上一跳失败之后转走的 */
+  failed: boolean
 }
 
-/** 建议关注按网关折叠：网关是运维的操作单位，展开才看具体路由。 */
-export interface GatewayDispatchAttentionGroup {
-  gateway_group_id: number
-  gateway_group_name: string
-  health: DispatchHealth
-  /** 以下四项是链级（一条请求算一次，不管跨了几条路由） */
-  requests: number
-  failover_requests: number
-  failed_requests: number
-  request_failover_rate: number
-  /** 以下是尝试级 */
-  attempts: number
-  failed_attempts: number
-  ttft_p95: number
-  severity: GatewayDispatchSeverityCounts
-  problem_routes: number
-  routes: GatewayDispatchAttentionRoute[]
-}
-
-export interface GatewayDispatchAttention {
+export interface GatewayDispatchFlow {
   from: string
   to: string
-  routes: number
-  problem_routes: number
-  severity: GatewayDispatchSeverityCounts
-  groups: GatewayDispatchAttentionGroup[]
+  /** all = 按网关分流；gateway = 下钻到该网关内部按跳数分流 */
+  scope: "all" | "gateway"
+  gateway_group_id?: number
+  gateway_group_name?: string
+  requests: number
+  attempts: number
+  /** 窗口内实际出现过的最深跳数（可能超过图上铺开的跳数） */
+  max_hops: number
+  nodes: GatewayDispatchFlowNode[]
+  links: GatewayDispatchFlowLink[]
+}
+
+/** 一条失败尝试的原文。刻意不归类、不合并、不截断。 */
+export interface GatewayDispatchRawError {
+  id: number
+  timestamp: string
+  request_id: string
+  attempt: number
+  attempt_kind?: string
+  gateway_group_id: number
+  gateway_group_name?: string
+  route_id: number
+  route_label?: string
+  model?: string
+  status_code: number
+  error_type?: string
+  duration_ms: number
+  message?: string
+  detail?: string
+  upstream_url?: string
+  upstream_body?: string
+  upstream_headers?: string
+}
+
+export interface GatewayDispatchRawErrors {
+  from: string
+  to: string
+  /** 窗口内失败尝试的全量条数；items 只是其中最近的 limit 条 */
+  total: number
+  limit: number
+  items: GatewayDispatchRawError[]
 }
 
 export interface GatewayDispatchErrorSample {
