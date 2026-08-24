@@ -89,11 +89,40 @@ function flowHeight(flow: GatewayDispatchFlow | null | undefined): number {
   return Math.min(900, Math.max(300, widest * 44 + 90))
 }
 
-function flowOption(flow: GatewayDispatchFlow) {
+function flowOption(flow: GatewayDispatchFlow, chartHeight: number) {
   const nodeByID = new Map(flow.nodes.map((node) => [node.id, node]))
   const total = flow.requests
   // 最后一列的标签默认画在节点右边，会被画布裁掉，翻到左边去
   const maxDepth = flow.nodes.reduce((max, node) => Math.max(max, node.depth), 0)
+
+  /**
+   * ECharts 的桑基布局用的是**全图统一**的像素/值比例（源码 sankeyLayout.js 里的
+   * minKy）：先给每一列各自算一个「(可用高度 - 本列间隙) / 本列 value 总和」，
+   * 取全图最小的那个当缩放比例，所有节点都按它换算高度——不是每列单独把自己
+   * 占满。这就是为什么第 1 跳里挤着一个 value=685 的大路由时，第 4 跳那两个
+   * value=4/5 的小路由，无论整张图有多高都只有一两像素，标签必然叠成一团
+   * （ECharts 的 sankey 系列不支持 labelLayout 防重叠，试过没用）。
+   * 这里把 minKy 按同样的公式复现一遍，用估算出的真实像素高度决定要不要画
+   * 标签——节点本身、连线、hover tooltip、点击都不受影响，只是常驻文字不占地方。
+   */
+  const depthTotals = new Map<number, number>()
+  const depthCounts = new Map<number, number>()
+  for (const node of flow.nodes) {
+    depthTotals.set(node.depth, (depthTotals.get(node.depth) ?? 0) + node.value)
+    depthCounts.set(node.depth, (depthCounts.get(node.depth) ?? 0) + 1)
+  }
+  const usableHeight = chartHeight - 28
+  let minKy = Infinity
+  for (const [depth, columnTotal] of depthTotals) {
+    if (columnTotal <= 0) continue
+    const gapTotal = Math.max(0, (depthCounts.get(depth) ?? 1) - 1) * 16
+    const ky = Math.max(0, usableHeight - gapTotal) / columnTotal
+    if (ky < minKy) minKy = ky
+  }
+  if (!Number.isFinite(minKy)) minKy = 0
+  const MIN_LABEL_HEIGHT = 13
+  const estimatedNodeHeight = (node: GatewayDispatchFlowNode): number => node.value * minKy
+
   return {
     animationDuration: 240,
     tooltip: {
@@ -156,8 +185,9 @@ function flowOption(flow: GatewayDispatchFlow) {
             textBorderColor: "rgba(255,255,255,.92)",
             textBorderWidth: 3,
             // 用 id 当 name 保证唯一（同一条路由在不同跳是不同节点），
-            // 所以标签必须自己给，不能让 ECharts 直接画 name
-            formatter: () => node.label,
+            // 所以标签必须自己给，不能让 ECharts 直接画 name；
+            // 节点太薄时干脆不给文字，省得跟邻居叠在一起（hover 还能看 tooltip）
+            formatter: () => estimatedNodeHeight(node) >= MIN_LABEL_HEIGHT ? node.label : "",
           },
         })),
         links: flow.links.map((link) => {
@@ -230,14 +260,26 @@ export function DispatchHealthPanel() {
     }
     if (!chart.current) chart.current = echarts.init(chartRef.current)
     const instance = chart.current
-    instance.setOption(flowOption(flowData), true)
+    instance.setOption(flowOption(flowData, height), true)
     // 容器高度会随节点数变，必须显式 resize——只 setOption 的话画布还是旧尺寸，
     // 内容会被压扁并溢出到下面的区块上
     instance.resize()
+    const nodeByID = new Map(flowData.nodes.map((node) => [node.id, node]))
     const onClick = (params: { dataType?: string; data?: unknown }) => {
-      if (params.dataType !== "node") return
-      const raw = (params.data as { raw?: GatewayDispatchFlowNode })?.raw
-      if (raw) handleNodeClick(raw)
+      if (params.dataType === "node") {
+        const raw = (params.data as { raw?: GatewayDispatchFlowNode })?.raw
+        if (raw) handleNodeClick(raw)
+        return
+      }
+      if (params.dataType === "edge") {
+        // 小节点的连线又细又难点中，点线本身也该算数：落到它流向的那个节点上
+        // （分流线接的是路由/结局，直接导航过去；退回 source 只是兜底，理论上不会用到）
+        const edge = params.data as { source?: string; target?: string }
+        const target = edge.target ? nodeByID.get(edge.target) : undefined
+        const source = edge.source ? nodeByID.get(edge.source) : undefined
+        const resolved = target ?? source
+        if (resolved) handleNodeClick(resolved)
+      }
     }
     instance.off("click")
     instance.on("click", onClick)
