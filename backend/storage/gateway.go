@@ -1310,8 +1310,13 @@ type GatewayDispatchFlow struct {
 type GatewayDispatchFlowHighlight struct {
 	// Failovers 这条链一共顺延了几次：总尝试数－1，含同路由重试（口径跟画图时的
 	// 「跳数」一致，跳数本来就是这条链一共打了几次尝试，重试也占一跳）。
-	Failovers int      `json:"failovers"`
-	NodeIDs   []string `json:"node_ids"`
+	Failovers int `json:"failovers"`
+	// Requests 这一组有多少条链。图上的线宽永远是「这条边总共走了多少请求」，
+	// 高亮只改深浅不改粗细（改粗细就得重新布局，那就是重画一张图了），所以一条
+	// 只有 3 个请求顺延到底的链，高亮出来照样是一条粗带子。把组的真实条数一起
+	// 返回，前端标在按钮上，免得把「走过这条路」看成「这么多流量走了这条路」。
+	Requests int      `json:"requests"`
+	NodeIDs  []string `json:"node_ids"`
 	// LinkKeys 格式 "source|target"，跟前端 link.source + "|" + link.target 对应
 	LinkKeys []string `json:"link_keys"`
 }
@@ -1694,6 +1699,7 @@ func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint) (Gatew
 			acc = newDispatchFlowHighlightAcc()
 			highlights[failovers] = acc
 		}
+		acc.requests++
 		for i, nodeID := range path {
 			acc.nodes[nodeID] = struct{}{}
 			if i > 0 {
@@ -1707,8 +1713,9 @@ func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint) (Gatew
 }
 
 type dispatchFlowHighlightAcc struct {
-	nodes map[string]struct{}
-	links map[string]struct{}
+	requests int
+	nodes    map[string]struct{}
+	links    map[string]struct{}
 }
 
 func newDispatchFlowHighlightAcc() *dispatchFlowHighlightAcc {
@@ -1735,7 +1742,7 @@ func buildDispatchFlowHighlights(acc map[int]*dispatchFlowHighlightAcc) []Gatewa
 		}
 		sort.Strings(linkKeys)
 		result = append(result, GatewayDispatchFlowHighlight{
-			Failovers: failovers, NodeIDs: nodeIDs, LinkKeys: linkKeys,
+			Failovers: failovers, Requests: group.requests, NodeIDs: nodeIDs, LinkKeys: linkKeys,
 		})
 	}
 	return result

@@ -1543,6 +1543,10 @@ func TestGatewayUsageDispatchFlowGroupsHighlightsByWholeChain(t *testing.T) {
 	if !equalStringSlices(zero.LinkKeys, wantZeroLinks) {
 		t.Fatalf("0 次 link keys = %v, want %v", zero.LinkKeys, wantZeroLinks)
 	}
+	// 组里到底几条链：图上线宽是这条边的总流量，高亮不改粗细，只能靠这个数说清
+	if zero.Requests != 1 {
+		t.Fatalf("0 次 requests = %d, want 1 (只有 fl-1)", zero.Requests)
+	}
 
 	// fl-2（成功）和 fl-3（失败）都顺延了 1 次，路径除了结局都一样——
 	// 高亮要覆盖两条链完整走过的节点/连线（从入口一路到各自的结局），不是只挑一跳
@@ -1557,6 +1561,9 @@ func TestGatewayUsageDispatchFlowGroupsHighlightsByWholeChain(t *testing.T) {
 	wantOneLinks := []string{"g:31|h1:r11", "h1:r11|h2:r12", "h2:r12|o:failed", "h2:r12|o:recovered"}
 	if !equalStringSlices(one.LinkKeys, wantOneLinks) {
 		t.Fatalf("1 次 link keys = %v, want %v", one.LinkKeys, wantOneLinks)
+	}
+	if one.Requests != 2 {
+		t.Fatalf("1 次 requests = %d, want 2 (fl-2 + fl-3)", one.Requests)
 	}
 
 	// 全部网关视图没有「跳」这个概念，高亮分组应该恒为空，别让前端误以为能高亮

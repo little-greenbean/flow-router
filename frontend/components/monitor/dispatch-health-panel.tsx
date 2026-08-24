@@ -32,10 +32,15 @@ import { cn } from "@/lib/utils"
  * 哪条路由上」逐层铺开。图上每类节点都是一个动作：路由 → 跳到路由配置，
  * 结局 → 跳到使用记录并带上对应筛选。
  *
- * 下钻某个网关后，上方会出现按跳数分的高亮按钮：点一下不重新请求数据、也不
- * 重新铺一张图，只是在当前这张图上把该跳的节点和相邻连线点亮、其余调暗
- * （ECharts 的 highlight/downplay action，配合已有的 emphasis.focus:'adjacency'）。
- * 可选的跳数直接取自当前已经加载的数据里实际出现过的跳数，不是固定列表。
+ * 下钻某个网关后，上方会出现按顺延次数分的高亮按钮：点一下不重新请求数据、也不
+ * 重新铺一张图，只把「顺延了这么多次的链，从入口到结局的完整路径」调亮、其余调暗
+ * （成员由后端按整条链算好，见 highlights）。可选次数取自这批数据里实际出现过的
+ * 次数，不是写死的列表。
+ *
+ * 高亮只认点击，hover 一律不改图（emphasis.focus:'none'）。桑基图上一个节点同时
+ * 属于很多条链，"我正悬停的那条链"根本没有唯一解——ECharts 的 adjacency 只看
+ * "这个节点挨着哪些边"，trajectory 更是把经过它的所有链全铺开，两种都会点亮一堆
+ * 别人的链，还会把点出来的高亮冲掉。悬停就只出 tooltip，别的什么都不动。
  */
 
 /**
@@ -95,9 +100,15 @@ function flowHeight(flow: GatewayDispatchFlow | null | undefined): number {
   return Math.min(900, Math.max(300, widest * 44 + 90))
 }
 
+const NODE_WIDTH = 13
+const NODE_GAP = 16
+/** 结局列的标签画在节点左边，跟倒数第二列的右侧标签抢同一条缝，给它留一块固定的地 */
+const OUTCOME_LABEL_RESERVE = 62
+
 function flowOption(
   flow: GatewayDispatchFlow,
   chartHeight: number,
+  chartWidth: number,
   highlight: GatewayDispatchFlowHighlight | null,
   animate: boolean,
 ) {
@@ -114,32 +125,27 @@ function flowOption(
   const maxDepth = flow.nodes.reduce((max, node) => Math.max(max, node.depth), 0)
 
   /**
-   * ECharts 的桑基布局用的是**全图统一**的像素/值比例（源码 sankeyLayout.js 里的
-   * minKy）：先给每一列各自算一个「(可用高度 - 本列间隙) / 本列 value 总和」，
-   * 取全图最小的那个当缩放比例，所有节点都按它换算高度——不是每列单独把自己
-   * 占满。这就是为什么第 1 跳里挤着一个 value=685 的大路由时，第 4 跳那两个
-   * value=4/5 的小路由，无论整张图有多高都只有一两像素，标签必然叠成一团
-   * （ECharts 的 sankey 系列不支持 labelLayout 防重叠，试过没用）。
-   * 这里把 minKy 按同样的公式复现一遍，用估算出的真实像素高度决定要不要画
-   * 标签——节点本身、连线、hover tooltip、点击都不受影响，只是常驻文字不占地方。
+   * 标签为什么改成"截断"而不是上一版的"矮节点干脆不画"：
+   *
+   * 桑基的 nodeGap 是**硬约束**——sankeyLayout.js 里 resolveCollisions 每一轮都会把
+   * 同一列的节点重新撑开到至少 nodeGap，minKy 又保证了最挤的那列刚好放得下，所以
+   * 同列两个标签垂直方向永远隔着 16px，10px 的字压根叠不到一起。按节点高度藏标签
+   * 是在治一个不存在的病，代价却极大：ECharts 的像素/值比例是**全图统一**的
+   * （minKy 取所有列里最小的那个），第 1 跳只要有个几千请求的大路由，后面几跳那些
+   * 几十请求的节点就只有零点几个像素高，于是「顺延到底走了哪几条路由」——正是这张
+   * 图最该说清楚的事——名字全没了。
+   *
+   * 真正会叠的是**横向**：标签画在节点右边，名字一长就压到下一列的节点和标签上。
+   * 所以按列间距给每个标签一个宽度上限，超出的截断，全名留给 tooltip。
    */
-  const depthTotals = new Map<number, number>()
-  const depthCounts = new Map<number, number>()
-  for (const node of flow.nodes) {
-    depthTotals.set(node.depth, (depthTotals.get(node.depth) ?? 0) + node.value)
-    depthCounts.set(node.depth, (depthCounts.get(node.depth) ?? 0) + 1)
+  const layoutWidth = Math.max(0, chartWidth - 20) // 跟下面 series 的 left/right 对齐
+  const columnGap = maxDepth > 0 ? (layoutWidth - NODE_WIDTH) / maxDepth : layoutWidth
+  const labelWidth = (depth: number): number => {
+    // 结局列是我们自己的短词（一次过 / 顺延后成功 / 最终失败），按预留的那块地算
+    if (depth === maxDepth) return Math.max(48, OUTCOME_LABEL_RESERVE)
+    const reserve = depth === maxDepth - 1 ? OUTCOME_LABEL_RESERVE : 0
+    return Math.max(48, columnGap - NODE_WIDTH - 18 - reserve)
   }
-  const usableHeight = chartHeight - 28
-  let minKy = Infinity
-  for (const [depth, columnTotal] of depthTotals) {
-    if (columnTotal <= 0) continue
-    const gapTotal = Math.max(0, (depthCounts.get(depth) ?? 1) - 1) * 16
-    const ky = Math.max(0, usableHeight - gapTotal) / columnTotal
-    if (ky < minKy) minKy = ky
-  }
-  if (!Number.isFinite(minKy)) minKy = 0
-  const MIN_LABEL_HEIGHT = 13
-  const estimatedNodeHeight = (node: GatewayDispatchFlowNode): number => node.value * minKy
 
   return {
     // 只在数据真的变了（换网关/换时间窗口/首次加载）才播入场动画；
@@ -192,11 +198,13 @@ function flowOption(
         right: 10,
         top: 14,
         bottom: 14,
-        nodeGap: 16,
-        nodeWidth: 13,
+        nodeGap: NODE_GAP,
+        nodeWidth: NODE_WIDTH,
         nodeAlign: "justify" as const,
         draggable: false,
-        emphasis: { focus: "adjacency" as const },
+        // hover 只出 tooltip：focus:'none' 不虚化任何东西；正高亮着的时候连自身的
+        // emphasis 样式都关掉，免得鼠标一扫就把调暗的节点重新点亮，跟高亮打架
+        emphasis: { focus: "none" as const, disabled: highlight != null },
         // 不要把节点字段摊到 data 上：我们的 label 是字符串，ECharts 的 label 是配置对象，
         // 摊平会互相覆盖（点一下就把 label 对象当成名字塞进 React，直接白屏）。
         // 原始节点整个挂在 raw 上，tooltip 和 click 都从 raw 取。
@@ -216,10 +224,13 @@ function flowOption(
               // 标签会压在色带上，加一圈白描边才读得清
               textBorderColor: "rgba(255,255,255,.92)",
               textBorderWidth: 3,
+              // 长名字压到下一列去正是之前那个"重叠"，按列间距截断；全名看 tooltip
+              width: labelWidth(node.depth),
+              overflow: "truncate" as const,
+              ellipsis: "…",
               // 用 id 当 name 保证唯一（同一条路由在不同跳是不同节点），
-              // 所以标签必须自己给，不能让 ECharts 直接画 name；
-              // 节点太薄时干脆不给文字，省得跟邻居叠在一起（hover 还能看 tooltip）
-              formatter: () => estimatedNodeHeight(node) >= MIN_LABEL_HEIGHT ? node.label : "",
+              // 所以标签必须自己给，不能让 ECharts 直接画 name
+              formatter: () => node.label,
             },
           }
         }),
@@ -328,10 +339,14 @@ export function DispatchHealthPanel() {
     // "图被重新画了一张"。真正数据变化（换网关/时间窗口）才会经过下面的动画。
     const dataChanged = lastFlowDataRef.current !== flowData
     lastFlowDataRef.current = flowData
-    instance.setOption(flowOption(flowData, height, activeHighlight, dataChanged), true)
-    // 容器高度会随节点数变，必须显式 resize——只 setOption 的话画布还是旧尺寸，
-    // 内容会被压扁并溢出到下面的区块上
-    instance.resize()
+    // 先 resize 再 setOption：容器高度会随节点数变，不 resize 的话画布还是旧尺寸，
+    // 内容会被压扁并溢出到下面的区块上；而且标签的截断宽度是按画布实际宽度算的，
+    // 必须拿到 resize 之后的尺寸才对得上
+    const draw = (animate: boolean) => {
+      instance.resize()
+      instance.setOption(flowOption(flowData, height, instance.getWidth(), activeHighlight, animate), true)
+    }
+    draw(dataChanged)
     const nodeByID = new Map(flowData.nodes.map((node) => [node.id, node]))
     const onClick = (params: { dataType?: string; data?: unknown }) => {
       if (params.dataType === "node") {
@@ -351,7 +366,8 @@ export function DispatchHealthPanel() {
     }
     instance.off("click")
     instance.on("click", onClick)
-    const resize = () => instance.resize()
+    // 窗口宽度变了列间距也变了，标签的截断宽度得跟着重算，所以整张重画（不带动画）
+    const resize = () => draw(false)
     window.addEventListener("resize", resize)
     return () => window.removeEventListener("resize", resize)
   }, [flowData, height, handleNodeClick, activeHighlight])
@@ -435,9 +451,10 @@ export function DispatchHealthPanel() {
             {highlightGroups.map((group) => (
               <button key={group.failovers} type="button"
                 onClick={() => setHighlightFailovers((current) => current === group.failovers ? null : group.failovers)}
-                title={`高亮顺延了 ${group.failovers} 次的完整请求链（入口到结局）`}
+                title={`高亮这 ${group.requests} 条顺延了 ${group.failovers} 次的请求链（入口到结局的完整路径）。注意线宽始终是该段的总流量，高亮只改深浅`}
                 className={cn("h-6 rounded px-1.5 text-[11px] tabular-nums", highlightFailovers === group.failovers ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
                 {group.failovers} 次
+                <span className="ml-1 opacity-55">{group.requests}</span>
               </button>
             ))}
           </div>

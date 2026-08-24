@@ -1023,6 +1023,9 @@ export interface GatewayDispatchFlow {
 export interface GatewayDispatchFlowHighlight {
   /** 这条链一共顺延了几次：总尝试数－1，含同路由重试 */
   failovers: number
+  /** 这一组有多少条链。图上线宽是"这条边总共多少请求"，高亮只改深浅不改粗细，
+   *  所以要把真实条数标出来，免得把"走过这条路"读成"这么多流量走了这条路" */
+  requests: number
   node_ids: string[]
   /** 格式 "source|target"，跟 link.source + "|" + link.target 对应 */
   link_keys: string[]
