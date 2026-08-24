@@ -109,6 +109,7 @@ function flowOption(
   flow: GatewayDispatchFlow,
   chartHeight: number,
   chartWidth: number,
+  labelColor: string,
   highlight: GatewayDispatchFlowHighlight | null,
   animate: boolean,
 ) {
@@ -163,8 +164,17 @@ function flowOption(
       // overflow:hidden），tooltip 就只能在这层容器内部定位、被这层裁切，
       // 无论算出什么坐标都跳不出这张卡片。
       appendToBody: false,
-      borderColor: "#dde3ea",
-      textStyle: { fontSize: 11 },
+      // tooltip 是 DOM 不是画布，可以直接吃 CSS 变量；ECharts 自己那套写死的白底
+      // 深字在深色主题下会突兀地亮一块。backgroundColor 留空交给 extraCssText，
+      // 它是最后拼上去的，能盖住 ECharts 的内联样式。
+      backgroundColor: "transparent",
+      borderWidth: 0,
+      padding: 0,
+      extraCssText:
+        "background:var(--popover);color:var(--popover-foreground);" +
+        "border:1px solid var(--border);border-radius:6px;padding:6px 8px;" +
+        "box-shadow:0 2px 8px rgb(0 0 0 / .12)",
+      textStyle: { fontSize: 11, color: "inherit" },
       formatter: (params: unknown) => {
         const item = params as { dataType?: string; data?: Record<string, unknown>; value?: number }
         if (item.dataType === "edge") {
@@ -218,12 +228,13 @@ function flowOption(
             itemStyle: { color: nodeColor(node), borderWidth: 0, borderRadius: 2, opacity: dimmed ? 0.15 : 1 },
             label: {
               fontSize: 10,
-              color: "#3b444f",
+              // 画布里不能写 CSS 变量（zrender 解析不了 oklch），颜色由 effect 从容器的
+              // 计算样式里取实际的 --foreground 再传进来，深浅色主题都跟着走。
+              // 不再给白描边：色带本身的不透明度只有 0.24~0.42，正文字压上去已经读得清，
+              // 描边反而糊成一团，深色主题下更是变成一圈白边把字吃掉。
+              color: labelColor,
               opacity: dimmed ? 0.35 : 1,
               position: node.depth === maxDepth ? ("left" as const) : ("right" as const),
-              // 标签会压在色带上，加一圈白描边才读得清
-              textBorderColor: "rgba(255,255,255,.92)",
-              textBorderWidth: 3,
               // 长名字压到下一列去正是之前那个"重叠"，按列间距截断；全名看 tooltip
               width: labelWidth(node.depth),
               overflow: "truncate" as const,
@@ -344,7 +355,15 @@ export function DispatchHealthPanel() {
     // 必须拿到 resize 之后的尺寸才对得上
     const draw = (animate: boolean) => {
       instance.resize()
-      instance.setOption(flowOption(flowData, height, instance.getWidth(), activeHighlight, animate), true)
+      // 容器上挂了 text-foreground，这里读到的是浏览器解析完的 rgb()，
+      // 直接给画布用是安全的（把 oklch 的 CSS 变量原样塞进去 zrender 认不出来）
+      const labelColor = chartRef.current
+        ? getComputedStyle(chartRef.current).color || "#3b444f"
+        : "#3b444f"
+      instance.setOption(
+        flowOption(flowData, height, instance.getWidth(), labelColor, activeHighlight, animate),
+        true,
+      )
     }
     draw(dataChanged)
     const nodeByID = new Map(flowData.nodes.map((node) => [node.id, node]))
@@ -369,7 +388,18 @@ export function DispatchHealthPanel() {
     // 窗口宽度变了列间距也变了，标签的截断宽度得跟着重算，所以整张重画（不带动画）
     const resize = () => draw(false)
     window.addEventListener("resize", resize)
-    return () => window.removeEventListener("resize", resize)
+    // 切主题也要重画（flowData 没变，不重画标签就停在上一个主题的颜色上）。
+    // 这里盯 <html> 的 class，而不是拿 next-themes 的 resolvedTheme 进依赖数组：
+    // React 的 effect 是自下而上跑的，ThemeProvider 在我们上层，它把 .dark 写到
+    // <html> 上比这个 effect 更晚——按 resolvedTheme 重画会读到**上一个**主题的
+    // 颜色（浅色主题下就是一片几乎看不见的白字）。盯 class 变化则保证读的时候
+    // 样式已经生效，顺带也覆盖了跟随系统主题的切换。
+    const themeObserver = new MutationObserver(() => draw(false))
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] })
+    return () => {
+      window.removeEventListener("resize", resize)
+      themeObserver.disconnect()
+    }
   }, [flowData, height, handleNodeClick, activeHighlight])
 
   useEffect(() => () => { chart.current?.dispose(); chart.current = null }, [])
@@ -476,7 +506,7 @@ export function DispatchHealthPanel() {
                 {/* position:relative + overflow:hidden 是给上面 appendToBody:false 的
                     tooltip 用的：tooltip 会挂在这层容器内部，被这层裁切，无论算出
                     什么坐标都跳不出这张卡片 */}
-                <div ref={chartRef} style={{ height, position: "relative", overflow: "hidden" }} className="w-full" />
+                <div ref={chartRef} style={{ height, position: "relative", overflow: "hidden" }} className="w-full text-foreground" />
                 {empty ? (
                   <div className="absolute inset-0 flex items-center justify-center bg-muted/20 text-[11px] text-muted-foreground">
                     {emptyText}
