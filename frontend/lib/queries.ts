@@ -172,11 +172,15 @@ export function useGatewayDispatchErrors(from?: string, to?: string) {
   return useApi<GatewayDispatchErrors>(`/gateway/dispatch/errors${suffix ? `?${suffix}` : ""}`)
 }
 
-export function useGatewayDispatchFlow(from?: string, to?: string, group?: number) {
+export function useGatewayDispatchFlow(
+  from?: string, to?: string, group?: number, failovers?: number,
+) {
   const params = new URLSearchParams()
   if (from) params.set("from", from)
   if (to) params.set("to", to)
   if (group) params.set("group", String(group))
+  // 0 是合法值（“零顺延”），不能用 if(failovers) 那种真值判断漏掉它
+  if (failovers != null && failovers >= 0) params.set("failovers", String(failovers))
   const suffix = params.toString()
   return useApi<GatewayDispatchFlow>(`/gateway/dispatch/flow${suffix ? `?${suffix}` : ""}`)
 }

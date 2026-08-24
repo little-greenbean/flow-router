@@ -986,7 +986,7 @@ export interface GatewayDispatchFlowNode {
   route_id?: number
   /** 路由节点在第几跳，1 = 首发 */
   hop?: number
-  /** false = 路由已删除，只剩历史日志，不提供跳转 */
+  /** false = 路由已删除，只剩历史日志，不提供跳转（路由节点必有此字段） */
   alive?: boolean
   /** 终点节点的结局：direct | recovered | failed */
   outcome?: string

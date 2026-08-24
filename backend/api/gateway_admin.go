@@ -240,7 +240,16 @@ func flowGatewayDispatch(c *gin.Context, d *Deps) {
 	if !ok {
 		return
 	}
-	flow, err := d.GatewayUsage.DispatchFlow(from, to, uint(queryInt(c, "group", 0)))
+	failoverFilter := storage.DispatchFlowFailoverFilterAny
+	if raw := strings.TrimSpace(c.Query("failovers")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid failovers filter"})
+			return
+		}
+		failoverFilter = parsed
+	}
+	flow, err := d.GatewayUsage.DispatchFlow(from, to, uint(queryInt(c, "group", 0)), failoverFilter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

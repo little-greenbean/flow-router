@@ -1422,7 +1422,7 @@ func flowNode(t *testing.T, flow GatewayDispatchFlow, id string) GatewayDispatch
 
 func TestGatewayUsageDispatchFlowSplitsByGateway(t *testing.T) {
 	usage, from, to := dispatchFlowFixture(t)
-	flow, err := usage.DispatchFlow(from, to, 0)
+	flow, err := usage.DispatchFlow(from, to, 0, DispatchFlowFailoverFilterAny)
 	if err != nil {
 		t.Fatalf("dispatch flow: %v", err)
 	}
@@ -1463,7 +1463,7 @@ func TestGatewayUsageDispatchFlowSplitsByGateway(t *testing.T) {
 
 func TestGatewayUsageDispatchFlowDrillsIntoRoutesByHop(t *testing.T) {
 	usage, from, to := dispatchFlowFixture(t)
-	flow, err := usage.DispatchFlow(from, to, 31)
+	flow, err := usage.DispatchFlow(from, to, 31, DispatchFlowFailoverFilterAny)
 	if err != nil {
 		t.Fatalf("dispatch flow: %v", err)
 	}
@@ -1508,6 +1508,88 @@ func TestGatewayUsageDispatchFlowDrillsIntoRoutesByHop(t *testing.T) {
 	if first.RouteID != 11 || second.RouteID != 12 {
 		t.Fatalf("route ids = %d/%d", first.RouteID, second.RouteID)
 	}
+	// 结局列紧跟在这个网关实际用到的最深一跳（2）后面，不是永远留到理论上限，
+	// 否则第 3～7 列全是空的，右边一大片死白
+	outcome := flowNode(t, flow, "o:direct")
+	if outcome.Depth != 3 {
+		t.Fatalf("outcome depth = %d, want 3 (maxHops 2 + 1)", outcome.Depth)
+	}
+}
+
+func TestGatewayUsageDispatchFlowFiltersByFailoverCount(t *testing.T) {
+	usage, from, to := dispatchFlowFixture(t)
+
+	// fl-1 零顺延（一次过），fl-2/fl-3 各顺延一次
+	zero, err := usage.DispatchFlow(from, to, 31, 0)
+	if err != nil {
+		t.Fatalf("dispatch flow: %v", err)
+	}
+	if zero.Requests != 1 || zero.Attempts != 1 {
+		t.Fatalf("filter=0 requests/attempts = %d/%d, want 1/1", zero.Requests, zero.Attempts)
+	}
+	if link := flowLink(t, zero, "h1:r11", "o:direct"); link.Value != 1 {
+		t.Fatalf("filter=0 h1:r11 -> direct = %d, want 1", link.Value)
+	}
+	// fl-2/fl-3 顺延过，这一档不该出现
+	for _, link := range zero.Links {
+		if link.Target == "h2:r12" {
+			t.Fatalf("filter=0 不该包含顺延过的链，却有 %+v", link)
+		}
+	}
+
+	one, err := usage.DispatchFlow(from, to, 31, 1)
+	if err != nil {
+		t.Fatalf("dispatch flow: %v", err)
+	}
+	if one.Requests != 2 || one.Attempts != 4 {
+		t.Fatalf("filter=1 requests/attempts = %d/%d, want 2/4", one.Requests, one.Attempts)
+	}
+	// fl-1 零顺延不该混进「顺延 1 次」这一档
+	for _, link := range one.Links {
+		if link.Target == "o:direct" {
+			t.Fatalf("filter=1 不该有 direct 分流，实际 %+v", link)
+		}
+	}
+
+	// 这份数据里没有任何链顺延 2 次——筛选结果应该是空的，而不是报错或退回全部
+	two, err := usage.DispatchFlow(from, to, 31, 2)
+	if err != nil {
+		t.Fatalf("dispatch flow: %v", err)
+	}
+	if two.Requests != 0 || len(two.Nodes) != 1 || two.Nodes[0].ID != "g:31" {
+		t.Fatalf("filter=2 = %+v, want 0 requests / 只剩网关根节点", two)
+	}
+}
+
+func TestDispatchFlowFailoverCountAndFilterBuckets(t *testing.T) {
+	count := dispatchFlowFailoverCount([]dispatchFlowAttempt{
+		{attemptKind: "primary"},
+		{attemptKind: "failover"},
+		{attemptKind: "retry"},
+		{attemptKind: "failover"},
+	})
+	if count != 2 {
+		t.Fatalf("failover count = %d, want 2 (重试不算顺延)", count)
+	}
+
+	cases := []struct {
+		name   string
+		count  int
+		filter int
+		want   bool
+	}{
+		{"不筛选总是命中", 0, DispatchFlowFailoverFilterAny, true},
+		{"精确匹配", 2, 2, true},
+		{"精确不匹配", 2, 3, false},
+		{"达到溢出档算命中", dispatchFlowFailoverFilterOverflow, dispatchFlowFailoverFilterOverflow, true},
+		{"超过溢出档也算命中", dispatchFlowFailoverFilterOverflow + 3, dispatchFlowFailoverFilterOverflow, true},
+		{"没到溢出档不该命中", dispatchFlowFailoverFilterOverflow - 1, dispatchFlowFailoverFilterOverflow, false},
+	}
+	for _, tc := range cases {
+		if got := dispatchFlowMatchesFailoverFilter(tc.count, tc.filter); got != tc.want {
+			t.Errorf("%s: matches(%d, %d) = %v, want %v", tc.name, tc.count, tc.filter, got, tc.want)
+		}
+	}
 }
 
 func TestGatewayUsageDispatchFlowCollapsesDeepChains(t *testing.T) {
@@ -1529,7 +1611,7 @@ func TestGatewayUsageDispatchFlowCollapsesDeepChains(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	flow, err := usage.DispatchFlow(from, to, 41)
+	flow, err := usage.DispatchFlow(from, to, 41, DispatchFlowFailoverFilterAny)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1556,7 +1638,7 @@ func TestGatewayUsageDispatchFlowCollapsesDeepChains(t *testing.T) {
 func TestGatewayUsageDispatchFlowListsGatewaysRegardlessOfDrill(t *testing.T) {
 	usage, from, to := dispatchFlowFixture(t)
 	// 下钻到 31 之后，tag 列表仍然要能看到 32——否则切不回去
-	flow, err := usage.DispatchFlow(from, to, 31)
+	flow, err := usage.DispatchFlow(from, to, 31, DispatchFlowFailoverFilterAny)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1576,10 +1658,10 @@ func TestGatewayUsageDispatchFlowRejectsBadRange(t *testing.T) {
 	db := openTestDB(t)
 	usage := NewGatewayUsageLogs(db)
 	now := time.Now().UTC()
-	if _, err := usage.DispatchFlow(now, now, 0); err == nil {
+	if _, err := usage.DispatchFlow(now, now, 0, DispatchFlowFailoverFilterAny); err == nil {
 		t.Fatal("zero-duration range should fail")
 	}
-	if _, err := usage.DispatchFlow(time.Time{}, now, 0); err == nil {
+	if _, err := usage.DispatchFlow(time.Time{}, now, 0, DispatchFlowFailoverFilterAny); err == nil {
 		t.Fatal("zero from should fail")
 	}
 }

@@ -74,3 +74,20 @@ export function routeColorIndex(routeID: number, paletteSize: number): number {
   if (!Number.isFinite(routeID) || paletteSize <= 0) return 0
   return Math.abs(Math.trunc(routeID)) % paletteSize
 }
+
+/**
+ * 顺延次数筛选档位。数值跟后端 dispatchFlowFailoverFilterOverflow 保持一致——
+ * 达到 5 是「5+ 次」这一档（精确到某个数字以上没意义，链路顺延次数没有自然上限，
+ * 桑基图本身也是从第 6 跳开始把更深的链收进一个溢出节点），比它小的都是精确匹配。
+ */
+export const DISPATCH_FAILOVER_FILTER_OVERFLOW = 5
+
+export const DISPATCH_FAILOVER_FILTER_OPTIONS: { value: number | null; label: string }[] = [
+  { value: null, label: "全部" },
+  { value: 0, label: "0 次" },
+  { value: 1, label: "1 次" },
+  { value: 2, label: "2 次" },
+  { value: 3, label: "3 次" },
+  { value: 4, label: "4 次" },
+  { value: DISPATCH_FAILOVER_FILTER_OVERFLOW, label: "5+ 次" },
+]
