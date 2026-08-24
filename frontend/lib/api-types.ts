@@ -974,18 +974,24 @@ export interface GatewayDispatchSeverityCounts {
 
 export type DispatchHealth = "action" | "watch" | "ok"
 
-export interface GatewayDispatchScorePoint {
+/** 「最近请求状态」里的一格。 */
+export interface GatewayDispatchAttempt {
   timestamp: string
-  failover_rate: number
-  ttft_p95: number
-  attempts: number
+  success: boolean
+  /** 失败时是 0/1/2 对应 P0/P1/P2；成功时是 -1 */
+  severity: number
+  status_code?: number
+  /** primary | retry | failover */
+  attempt_kind?: string
+  model?: string
+  first_token_ms?: number
+  message?: string
 }
 
-/** 路由健康记分卡的一行：回答「这条路由该不该禁掉」。 */
-export interface GatewayDispatchScoreRoute {
+/** 建议关注里的一条路由：回答「这条路由该不该禁掉」。 */
+export interface GatewayDispatchAttentionRoute {
   route_id: number
   gateway_group_id: number
-  gateway_group_name: string
   /** 来源：渠道名，或 provider 路由的 provider 名 */
   source_name?: string
   /** 源分组 */
@@ -1001,18 +1007,45 @@ export interface GatewayDispatchScoreRoute {
   failover_rate: number
   /** 该路由失败所在的请求链里，顺延次数最多的那条链顺延了几次 */
   max_failover_depth: number
+  /** 窗口末尾还连着败几次（正在坏） */
+  current_fail_streak: number
+  /** 窗口内最长的一段连败（坏得最狠时有多狠） */
+  max_fail_streak: number
   ttft_p95: number
   severity: GatewayDispatchSeverityCounts
   top_error?: string
   /** 健康档位由后端判定（见 dispatchRouteHealth），排序也按它，两者永远一致 */
   health: DispatchHealth
-  points: GatewayDispatchScorePoint[]
+  /** 最近若干次尝试，时间正序（左旧右新） */
+  recent: GatewayDispatchAttempt[]
 }
 
-export interface GatewayDispatchScorecard {
+/** 建议关注按网关折叠：网关是运维的操作单位，展开才看具体路由。 */
+export interface GatewayDispatchAttentionGroup {
+  gateway_group_id: number
+  gateway_group_name: string
+  health: DispatchHealth
+  /** 以下四项是链级（一条请求算一次，不管跨了几条路由） */
+  requests: number
+  failover_requests: number
+  failed_requests: number
+  request_failover_rate: number
+  /** 以下是尝试级 */
+  attempts: number
+  failed_attempts: number
+  ttft_p95: number
+  severity: GatewayDispatchSeverityCounts
+  problem_routes: number
+  routes: GatewayDispatchAttentionRoute[]
+}
+
+export interface GatewayDispatchAttention {
   from: string
   to: string
-  routes: GatewayDispatchScoreRoute[]
+  routes: number
+  problem_routes: number
+  severity: GatewayDispatchSeverityCounts
+  groups: GatewayDispatchAttentionGroup[]
 }
 
 export interface GatewayDispatchErrorSample {

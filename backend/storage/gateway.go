@@ -867,17 +867,17 @@ type GatewayDispatchErrorSample struct {
 // 以及由此产出的 Categories / Samples 是**尝试**口径，含被顺延救回的那些失败。
 // 路由层没有「最终失败」概念（顺延后可能由别的路由收尾），所以路由只填尝试口径。
 type GatewayDispatchErrorScope struct {
-	Requests          int                            `json:"requests"`
-	FinalFailed       int                            `json:"final_failed"`
-	ErrorRate         float64                        `json:"error_rate"`
-	RecoveredRequests int                            `json:"recovered_requests"`
-	Attempts          int                            `json:"attempts"`
-	FailedAttempts    int                            `json:"failed_attempts"`
-	AttemptErrorRate  float64                        `json:"attempt_error_rate"`
+	Requests          int     `json:"requests"`
+	FinalFailed       int     `json:"final_failed"`
+	ErrorRate         float64 `json:"error_rate"`
+	RecoveredRequests int     `json:"recovered_requests"`
+	Attempts          int     `json:"attempts"`
+	FailedAttempts    int     `json:"failed_attempts"`
+	AttemptErrorRate  float64 `json:"attempt_error_rate"`
 	// Severity 按处理紧急度把失败尝试分成 P0/P1/P2
 	Severity   GatewayDispatchSeverityCounts  `json:"severity"`
 	Categories []GatewayDispatchErrorCategory `json:"categories"`
-	Samples           []GatewayDispatchErrorSample   `json:"samples"`
+	Samples    []GatewayDispatchErrorSample   `json:"samples"`
 }
 
 type GatewayDispatchErrorRoute struct {
@@ -1189,15 +1189,19 @@ func (r *GatewayUsageLogs) DispatchErrors(from, to time.Time) (GatewayDispatchEr
 	return result, nil
 }
 
-// ---- 路由健康记分卡 ----
+// ---- 建议关注 ----
 //
-// 记分卡回答的是一个很具体的问题：「这条路由该不该禁掉」。所以它按路由横向铺开，
-// 而不是按时间铺开——路由之间的比较才是决策依据，趋势只用迷你折线交代一下走向。
+// 这一块回答的是「现在该盯哪条路由、要不要把它禁掉」。组织方式是**按网关折叠**：
+// 网关是运维的操作单位（一个网关一组备选路由），先看哪个网关在顺延，再展开看是
+// 哪条路由拖的后腿，最后看它最近这些请求到底成没成。
+//
+// 跟 DispatchErrors 的分工：那个按错误类型下钻（错在哪），这个按路由排队（谁该处理）。
 
 // 错误分级按「要不要人工介入」划分，不是按 HTTP 状态码，也不是按用户影响面：
-//   P0 需人工处理——认证失效 / 欠费 / 分组被删 / 配置写错，放着永远不会自愈
-//   P1 上游抖动——5xx / 429 / 超时 / 传输错，可能自愈但要盯着
-//   P2 噪声——客户端主动断开或取消，通常不用管
+//
+//	P0 需人工处理——认证失效 / 欠费 / 分组被删 / 配置写错，放着永远不会自愈
+//	P1 上游抖动——5xx / 429 / 超时 / 传输错，可能自愈但要盯着
+//	P2 噪声——客户端主动断开或取消，通常不用管
 const (
 	dispatchSeverityP0 = 0
 	dispatchSeverityP1 = 1
@@ -1233,17 +1237,23 @@ type GatewayDispatchSeverityCounts struct {
 	P2 int `json:"p2"`
 }
 
-type GatewayDispatchScorePoint struct {
-	Timestamp    time.Time `json:"timestamp"`
-	FailoverRate float64   `json:"failover_rate"`
-	TTFTP95      float64   `json:"ttft_p95"`
-	Attempts     int       `json:"attempts"`
+// GatewayDispatchAttempt 是「最近请求状态」里的一格。
+// 只带够画一格 + 悬浮解释的字段，不把整条日志抬出来。
+type GatewayDispatchAttempt struct {
+	Timestamp time.Time `json:"timestamp"`
+	Success   bool      `json:"success"`
+	// Severity 失败时为 P0/P1/P2，成功时为 -1
+	Severity     int    `json:"severity"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	AttemptKind  string `json:"attempt_kind,omitempty"`
+	Model        string `json:"model,omitempty"`
+	FirstTokenMS int64  `json:"first_token_ms,omitempty"`
+	Message      string `json:"message,omitempty"`
 }
 
-type GatewayDispatchScoreRoute struct {
-	RouteID          uint   `json:"route_id"`
-	GatewayGroupID   uint   `json:"gateway_group_id"`
-	GatewayGroupName string `json:"gateway_group_name"`
+type GatewayDispatchAttentionRoute struct {
+	RouteID        uint `json:"route_id"`
+	GatewayGroupID uint `json:"gateway_group_id"`
 	// SourceName 来源（渠道名，或 provider 路由的 provider 名）；
 	// SourceGroupName 源分组。两者才是人能认出来的身份，密钥名只是兜底。
 	SourceName      string `json:"source_name,omitempty"`
@@ -1258,37 +1268,76 @@ type GatewayDispatchScoreRoute struct {
 	FailedAttempts int     `json:"failed_attempts"`
 	FailoverRate   float64 `json:"failover_rate"`
 	// MaxFailoverDepth：该路由失败所在的请求链里，顺延次数最多的那条链顺延了几次。
-	// 回答「这条路由挂掉时，整个链还要再折腾几跳」。路由没失败过就是 0。
-	MaxFailoverDepth int                           `json:"max_failover_depth"`
-	TTFTP95          float64                       `json:"ttft_p95"`
-	Severity         GatewayDispatchSeverityCounts `json:"severity"`
-	TopError         string                        `json:"top_error,omitempty"`
-	// Health: action | watch | ok，见 dispatchRouteHealth。排序也按它来，
-	// 保证「排在前面」和「标成需处理」永远是一回事。
-	Health string                      `json:"health"`
-	Points []GatewayDispatchScorePoint `json:"points"`
+	// 回答「这条路由挂掉时，整个链还要再折腾几跳」。
+	MaxFailoverDepth int `json:"max_failover_depth"`
+	// 连败：CurrentFailStreak 是窗口末尾还在连着败的次数（正在坏），
+	// MaxFailStreak 是窗口内最长的一段（坏得最狠时有多狠）。
+	// 连败比失败率更能说明「该禁了」——20% 失败率散着出现是抖动，连着 8 次就是挂了。
+	CurrentFailStreak int                           `json:"current_fail_streak"`
+	MaxFailStreak     int                           `json:"max_fail_streak"`
+	TTFTP95           float64                       `json:"ttft_p95"`
+	Severity          GatewayDispatchSeverityCounts `json:"severity"`
+	TopError          string                        `json:"top_error,omitempty"`
+	Health            string                        `json:"health"`
+	// Recent 最近若干次尝试，按时间正序（左旧右新）
+	Recent []GatewayDispatchAttempt `json:"recent"`
+}
+
+type GatewayDispatchAttentionGroup struct {
+	GatewayGroupID   uint   `json:"gateway_group_id"`
+	GatewayGroupName string `json:"gateway_group_name"`
+	Health           string `json:"health"`
+
+	Requests int `json:"requests"`
+	// FailoverRequests 至少顺延过一次的请求数；FailedRequests 顺延完还是没救回来的请求数。
+	// 网关这一层看「请求有没有被救回来」，路由那一层才看尝试级失败率——别混。
+	FailoverRequests    int                             `json:"failover_requests"`
+	FailedRequests      int                             `json:"failed_requests"`
+	RequestFailoverRate float64                         `json:"request_failover_rate"`
+	Attempts            int                             `json:"attempts"`
+	FailedAttempts      int                             `json:"failed_attempts"`
+	TTFTP95             float64                         `json:"ttft_p95"`
+	Severity            GatewayDispatchSeverityCounts   `json:"severity"`
+	ProblemRoutes       int                             `json:"problem_routes"`
+	Routes              []GatewayDispatchAttentionRoute `json:"routes"`
+}
+
+type GatewayDispatchAttention struct {
+	From          time.Time                       `json:"from"`
+	To            time.Time                       `json:"to"`
+	Routes        int                             `json:"routes"`
+	ProblemRoutes int                             `json:"problem_routes"`
+	Severity      GatewayDispatchSeverityCounts   `json:"severity"`
+	Groups        []GatewayDispatchAttentionGroup `json:"groups"`
 }
 
 // 健康判定阈值。
 // P0 用「占尝试的比例」而不是「有没有」：370 次尝试里偶发 1 次配置错，
 // 跟 411 次余额不足完全不是一回事，一律标红会让这个标记失去意义。
 const (
-	dispatchActionP0Rate    = 0.01 // P0 占尝试 1% 以上 → 需处理
-	dispatchActionFailover  = 0.5  // 顺延率过半 → 需处理
-	dispatchWatchFailover   = 0.1  // 顺延率上双位数 → 关注
-	dispatchWatchTTFTMillis = 10_000
+	dispatchActionP0Rate     = 0.01 // P0 占尝试 1% 以上 → 需处理
+	dispatchActionFailover   = 0.5  // 顺延率过半 → 需处理
+	dispatchActionFailStreak = 5    // 末尾连败 5 次以上 → 需处理（正在挂）
+	dispatchWatchFailover    = 0.1  // 顺延率上双位数 → 关注
+	dispatchWatchFailStreak  = 3
+	dispatchWatchTTFTMillis  = 10_000
 )
 
-func dispatchRouteHealth(route GatewayDispatchScoreRoute) string {
+func dispatchRouteHealth(route GatewayDispatchAttentionRoute) string {
 	p0Rate := 0.0
 	if route.Attempts > 0 {
 		p0Rate = float64(route.Severity.P0) / float64(route.Attempts)
 	}
-	if p0Rate >= dispatchActionP0Rate || route.FailoverRate >= dispatchActionFailover {
+	if p0Rate >= dispatchActionP0Rate ||
+		route.FailoverRate >= dispatchActionFailover ||
+		route.CurrentFailStreak >= dispatchActionFailStreak {
 		return "action"
 	}
-	// 有 P0 但占比不高，仍然值得看一眼，只是不到"立刻处理"
-	if route.Severity.P0 > 0 || route.FailoverRate >= dispatchWatchFailover || route.TTFTP95 > dispatchWatchTTFTMillis {
+	// 有 P0 但占比不高，仍然值得看一眼，只是不到「立刻处理」
+	if route.Severity.P0 > 0 ||
+		route.FailoverRate >= dispatchWatchFailover ||
+		route.CurrentFailStreak >= dispatchWatchFailStreak ||
+		route.TTFTP95 > dispatchWatchTTFTMillis {
 		return "watch"
 	}
 	return "ok"
@@ -1306,22 +1355,10 @@ func dispatchHealthRank(health string) int {
 	}
 }
 
-type GatewayDispatchScorecard struct {
-	From   time.Time                   `json:"from"`
-	To     time.Time                   `json:"to"`
-	Routes []GatewayDispatchScoreRoute `json:"routes"`
-}
+// 每条路由保留多少格「最近请求状态」。够铺满一行又不至于把响应撑大。
+const dispatchRecentAttempts = 30
 
-// 迷你折线的取样点数；固定份数比固定时长好——窗口拉长拉短，图形密度不变。
-const dispatchScoreBuckets = 24
-
-type dispatchScoreBucket struct {
-	attempts int
-	failed   int
-	ttft     []float64
-}
-
-type dispatchScoreAcc struct {
+type dispatchAttentionAcc struct {
 	groupID   uint
 	channelID uint
 	provider  string
@@ -1336,23 +1373,40 @@ type dispatchScoreAcc struct {
 	chains   map[string]struct{}
 	// failedChains 记录该路由失败过的链，用于算 MaxFailoverDepth
 	failedChains map[string]struct{}
-	buckets      []dispatchScoreBucket
+
+	curStreak int
+	maxStreak int
+	recent    []GatewayDispatchAttempt
 }
 
-func newDispatchScoreAcc() *dispatchScoreAcc {
-	return &dispatchScoreAcc{
+func newDispatchAttentionAcc() *dispatchAttentionAcc {
+	return &dispatchAttentionAcc{
 		errors:       make(map[string]int),
 		chains:       make(map[string]struct{}),
 		failedChains: make(map[string]struct{}),
-		buckets:      make([]dispatchScoreBucket, dispatchScoreBuckets),
+		recent:       make([]GatewayDispatchAttempt, 0, dispatchRecentAttempts),
 	}
 }
 
-// DispatchScorecard 按路由汇总窗口内的健康度，供「该不该禁用这条路由」的判断。
-// 与 DispatchErrors 的区别：那个是错误的下钻分布，这个是路由之间的横向比较。
-func (r *GatewayUsageLogs) DispatchScorecard(from, to time.Time) (GatewayDispatchScorecard, error) {
+func (a *dispatchAttentionAcc) pushRecent(mark GatewayDispatchAttempt) {
+	a.recent = append(a.recent, mark)
+	if len(a.recent) > dispatchRecentAttempts {
+		a.recent = a.recent[len(a.recent)-dispatchRecentAttempts:]
+	}
+}
+
+// dispatchChainState 是一条请求链（同网关 + 同 RequestID）的汇总。
+type dispatchChainState struct {
+	groupID   uint
+	failovers int
+	// lastFailed 按时间序不断覆盖，收尾时就是「这条链最终成没成」
+	lastFailed bool
+}
+
+// DispatchAttention 按网关折叠汇总窗口内的调度健康度。
+func (r *GatewayUsageLogs) DispatchAttention(from, to time.Time) (GatewayDispatchAttention, error) {
 	if from.IsZero() || to.IsZero() || !to.After(from) {
-		return GatewayDispatchScorecard{}, fmt.Errorf("invalid dispatch scorecard range")
+		return GatewayDispatchAttention{}, fmt.Errorf("invalid dispatch attention range")
 	}
 	var logs []GatewayUsageLog
 	query := r.db.Where("created_at >= ? AND created_at < ?", from, to)
@@ -1360,37 +1414,21 @@ func (r *GatewayUsageLogs) DispatchScorecard(from, to time.Time) (GatewayDispatc
 		query = r.db.Where("CAST(strftime('%s', created_at) AS INTEGER) >= ? AND CAST(strftime('%s', created_at) AS INTEGER) < ?", from.Unix(), to.Unix())
 	}
 	if err := query.Order("created_at ASC, id ASC").Find(&logs).Error; err != nil {
-		return GatewayDispatchScorecard{}, err
+		return GatewayDispatchAttention{}, err
 	}
-	result := GatewayDispatchScorecard{From: from, To: to, Routes: []GatewayDispatchScoreRoute{}}
+	result := GatewayDispatchAttention{From: from, To: to, Groups: []GatewayDispatchAttentionGroup{}}
 	if len(logs) == 0 {
 		return result, nil
 	}
 
-	span := to.Sub(from)
-	bucketOf := func(ts time.Time) int {
-		if span <= 0 {
-			return 0
-		}
-		idx := int(float64(ts.Sub(from)) / float64(span) * dispatchScoreBuckets)
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= dispatchScoreBuckets {
-			idx = dispatchScoreBuckets - 1
-		}
-		return idx
-	}
-
-	routes := make(map[uint]*dispatchScoreAcc)
+	routes := make(map[uint]*dispatchAttentionAcc)
 	routeOrder := make([]uint, 0)
-	// chainFailovers 统计每条请求链顺延了几次（同链内 attempt_kind=failover 的尝试数）
-	chainFailovers := make(map[string]int)
+	chains := make(map[string]*dispatchChainState)
 
 	for _, log := range logs {
 		acc := routes[log.RouteID]
 		if acc == nil {
-			acc = newDispatchScoreAcc()
+			acc = newDispatchAttentionAcc()
 			acc.groupID = log.GatewayGroupID
 			routes[log.RouteID] = acc
 			routeOrder = append(routeOrder, log.RouteID)
@@ -1410,26 +1448,56 @@ func (r *GatewayUsageLogs) DispatchScorecard(from, to time.Time) (GatewayDispatc
 		}
 
 		chainKey := fmt.Sprintf("%d:%s", log.GatewayGroupID, log.RequestID)
-		acc.chains[chainKey] = struct{}{}
+		chain := chains[chainKey]
+		if chain == nil {
+			chain = &dispatchChainState{groupID: log.GatewayGroupID}
+			chains[chainKey] = chain
+		}
 		if log.AttemptKind == "failover" {
-			chainFailovers[chainKey]++
+			chain.failovers++
 		}
+		chain.lastFailed = !log.Success
+		acc.chains[chainKey] = struct{}{}
 
-		idx := bucketOf(log.CreatedAt)
 		acc.attempts++
-		acc.buckets[idx].attempts++
+		var firstToken int64
 		if log.FirstTokenMS != nil && *log.FirstTokenMS > 0 {
-			ttft := float64(*log.FirstTokenMS)
-			acc.ttft = append(acc.ttft, ttft)
-			acc.buckets[idx].ttft = append(acc.buckets[idx].ttft, ttft)
+			firstToken = *log.FirstTokenMS
+			acc.ttft = append(acc.ttft, float64(firstToken))
 		}
+		severity := dispatchSeverityOf(log)
+		message := ""
+		if !log.Success {
+			message = strings.TrimSpace(log.ErrorMessage)
+			if message == "" {
+				message = dispatchErrorTypeLabel(log.ErrorType)
+			}
+			if len([]rune(message)) > 120 {
+				message = string([]rune(message)[:120]) + "…"
+			}
+		}
+		acc.pushRecent(GatewayDispatchAttempt{
+			Timestamp:    log.CreatedAt,
+			Success:      log.Success,
+			Severity:     severity,
+			StatusCode:   log.StatusCode,
+			AttemptKind:  log.AttemptKind,
+			Model:        log.RequestedModel,
+			FirstTokenMS: firstToken,
+			Message:      message,
+		})
+
 		if log.Success {
+			acc.curStreak = 0
 			continue
 		}
 		acc.failed++
-		acc.buckets[idx].failed++
+		acc.curStreak++
+		if acc.curStreak > acc.maxStreak {
+			acc.maxStreak = acc.curStreak
+		}
 		acc.failedChains[chainKey] = struct{}{}
-		switch dispatchSeverityOf(log) {
+		switch severity {
 		case dispatchSeverityP0:
 			acc.severity.P0++
 		case dispatchSeverityP2:
@@ -1437,17 +1505,10 @@ func (r *GatewayUsageLogs) DispatchScorecard(from, to time.Time) (GatewayDispatc
 		default:
 			acc.severity.P1++
 		}
-		message := strings.TrimSpace(log.ErrorMessage)
-		if message == "" {
-			message = dispatchErrorTypeLabel(log.ErrorType)
-		}
-		if len([]rune(message)) > 120 {
-			message = string([]rune(message)[:120]) + "…"
-		}
 		acc.errors[message]++
 	}
 
-	// 路由现状：是否还存在、是否启用、以及所属网关组
+	// 路由现状：是否还存在、是否启用
 	aliveRoutes := make(map[uint]GatewayRoute)
 	var dbRoutes []GatewayRoute
 	if err := r.db.Where("id IN ?", routeOrder).Find(&dbRoutes).Error; err == nil {
@@ -1455,7 +1516,6 @@ func (r *GatewayUsageLogs) DispatchScorecard(from, to time.Time) (GatewayDispatc
 			aliveRoutes[route.ID] = route
 		}
 	}
-	// 渠道名（来源）
 	channelIDs := make([]uint, 0)
 	groupIDs := make([]uint, 0)
 	seenChannel := make(map[uint]struct{})
@@ -1491,22 +1551,24 @@ func (r *GatewayUsageLogs) DispatchScorecard(from, to time.Time) (GatewayDispatc
 		}
 	}
 
+	grouped := make(map[uint]*GatewayDispatchAttentionGroup)
+	groupOrder := make([]uint, 0)
+	groupTTFT := make(map[uint][]float64)
+
 	for _, routeID := range routeOrder {
 		acc := routes[routeID]
-		item := GatewayDispatchScoreRoute{
-			RouteID:         routeID,
-			GatewayGroupID:  acc.groupID,
-			SourceGroupName: acc.srcGroup,
-			KeyName:         acc.keyName,
-			Requests:        len(acc.chains),
-			Attempts:        acc.attempts,
-			FailedAttempts:  acc.failed,
-			Severity:        acc.severity,
-		}
-		if name, ok := groupNames[acc.groupID]; ok {
-			item.GatewayGroupName = name
-		} else {
-			item.GatewayGroupName = fmt.Sprintf("组 #%d", acc.groupID)
+		item := GatewayDispatchAttentionRoute{
+			RouteID:           routeID,
+			GatewayGroupID:    acc.groupID,
+			SourceGroupName:   acc.srcGroup,
+			KeyName:           acc.keyName,
+			Requests:          len(acc.chains),
+			Attempts:          acc.attempts,
+			FailedAttempts:    acc.failed,
+			CurrentFailStreak: acc.curStreak,
+			MaxFailStreak:     acc.maxStreak,
+			Severity:          acc.severity,
+			Recent:            acc.recent,
 		}
 		// 来源优先用渠道名；provider 类路由没有渠道，退回 provider 名
 		if name, ok := channelNames[acc.channelID]; ok && name != "" {
@@ -1522,13 +1584,14 @@ func (r *GatewayUsageLogs) DispatchScorecard(from, to time.Time) (GatewayDispatc
 			item.FailoverRate = float64(acc.failed) / float64(acc.attempts)
 		}
 		for chainKey := range acc.failedChains {
-			if depth := chainFailovers[chainKey]; depth > item.MaxFailoverDepth {
-				item.MaxFailoverDepth = depth
+			if chain := chains[chainKey]; chain != nil && chain.failovers > item.MaxFailoverDepth {
+				item.MaxFailoverDepth = chain.failovers
 			}
 		}
 		if len(acc.ttft) > 0 {
-			sort.Float64s(acc.ttft)
-			item.TTFTP95 = percentileFloat(acc.ttft, 0.95)
+			sorted := append([]float64(nil), acc.ttft...)
+			sort.Float64s(sorted)
+			item.TTFTP95 = percentileFloat(sorted, 0.95)
 		}
 		topCount := 0
 		for message, count := range acc.errors {
@@ -1537,40 +1600,111 @@ func (r *GatewayUsageLogs) DispatchScorecard(from, to time.Time) (GatewayDispatc
 				topCount = count
 			}
 		}
-		item.Points = make([]GatewayDispatchScorePoint, 0, dispatchScoreBuckets)
-		step := span / dispatchScoreBuckets
-		for i := range acc.buckets {
-			bucket := acc.buckets[i]
-			point := GatewayDispatchScorePoint{
-				Timestamp: from.Add(time.Duration(i) * step),
-				Attempts:  bucket.attempts,
-			}
-			if bucket.attempts > 0 {
-				point.FailoverRate = float64(bucket.failed) / float64(bucket.attempts)
-			}
-			if len(bucket.ttft) > 0 {
-				sort.Float64s(bucket.ttft)
-				point.TTFTP95 = percentileFloat(bucket.ttft, 0.95)
-			}
-			item.Points = append(item.Points, point)
-		}
 		item.Health = dispatchRouteHealth(item)
-		result.Routes = append(result.Routes, item)
+
+		group := grouped[acc.groupID]
+		if group == nil {
+			name, ok := groupNames[acc.groupID]
+			if !ok {
+				name = fmt.Sprintf("组 #%d", acc.groupID)
+			}
+			group = &GatewayDispatchAttentionGroup{
+				GatewayGroupID:   acc.groupID,
+				GatewayGroupName: name,
+				Health:           "ok",
+				Routes:           []GatewayDispatchAttentionRoute{},
+			}
+			grouped[acc.groupID] = group
+			groupOrder = append(groupOrder, acc.groupID)
+		}
+		group.Routes = append(group.Routes, item)
+		group.Attempts += item.Attempts
+		group.FailedAttempts += item.FailedAttempts
+		group.Severity.P0 += item.Severity.P0
+		group.Severity.P1 += item.Severity.P1
+		group.Severity.P2 += item.Severity.P2
+		groupTTFT[acc.groupID] = append(groupTTFT[acc.groupID], acc.ttft...)
+		if item.Health != "ok" {
+			group.ProblemRoutes++
+		}
+		if dispatchHealthRank(item.Health) < dispatchHealthRank(group.Health) {
+			group.Health = item.Health
+		}
+
+		result.Routes++
+		if item.Health != "ok" {
+			result.ProblemRoutes++
+		}
+		result.Severity.P0 += item.Severity.P0
+		result.Severity.P1 += item.Severity.P1
+		result.Severity.P2 += item.Severity.P2
 	}
 
-	// 「最该处理」排前面：先按健康档位，档内再按坏得多厉害。
-	sort.Slice(result.Routes, func(i, j int) bool {
-		a, b := result.Routes[i], result.Routes[j]
+	// 链级统计归到网关：一条链只算一次，不管它跨了几条路由
+	for _, chain := range chains {
+		group := grouped[chain.groupID]
+		if group == nil {
+			continue
+		}
+		group.Requests++
+		if chain.failovers > 0 {
+			group.FailoverRequests++
+		}
+		if chain.lastFailed {
+			group.FailedRequests++
+		}
+	}
+
+	for _, groupID := range groupOrder {
+		group := grouped[groupID]
+		if group.Requests > 0 {
+			group.RequestFailoverRate = float64(group.FailoverRequests) / float64(group.Requests)
+		}
+		if values := groupTTFT[groupID]; len(values) > 0 {
+			sort.Float64s(values)
+			group.TTFTP95 = percentileFloat(values, 0.95)
+		}
+		// 组内也是「最该处理排前面」：先看档位，再看要人工介入的量（P0），
+		// 然后才是「正在连败」和顺延率。P0 排在连败前面，是因为末尾偶然失败一次
+		// 也算连败 1，拿它当第一排序键会把噪声顶到最上面。
+		sort.Slice(group.Routes, func(i, j int) bool {
+			a, b := group.Routes[i], group.Routes[j]
+			if ra, rb := dispatchHealthRank(a.Health), dispatchHealthRank(b.Health); ra != rb {
+				return ra < rb
+			}
+			if a.Severity.P0 != b.Severity.P0 {
+				return a.Severity.P0 > b.Severity.P0
+			}
+			if a.CurrentFailStreak != b.CurrentFailStreak {
+				return a.CurrentFailStreak > b.CurrentFailStreak
+			}
+			if a.FailoverRate != b.FailoverRate {
+				return a.FailoverRate > b.FailoverRate
+			}
+			if a.FailedAttempts != b.FailedAttempts {
+				return a.FailedAttempts > b.FailedAttempts
+			}
+			return a.RouteID < b.RouteID
+		})
+		result.Groups = append(result.Groups, *group)
+	}
+
+	// 「最该处理」的网关排前面
+	sort.Slice(result.Groups, func(i, j int) bool {
+		a, b := result.Groups[i], result.Groups[j]
 		if ra, rb := dispatchHealthRank(a.Health), dispatchHealthRank(b.Health); ra != rb {
 			return ra < rb
 		}
-		if a.FailoverRate != b.FailoverRate {
-			return a.FailoverRate > b.FailoverRate
+		if a.Severity.P0 != b.Severity.P0 {
+			return a.Severity.P0 > b.Severity.P0
 		}
-		if a.FailedAttempts != b.FailedAttempts {
-			return a.FailedAttempts > b.FailedAttempts
+		if a.RequestFailoverRate != b.RequestFailoverRate {
+			return a.RequestFailoverRate > b.RequestFailoverRate
 		}
-		return a.RouteID < b.RouteID
+		if a.ProblemRoutes != b.ProblemRoutes {
+			return a.ProblemRoutes > b.ProblemRoutes
+		}
+		return a.GatewayGroupID < b.GatewayGroupID
 	})
 	return result, nil
 }

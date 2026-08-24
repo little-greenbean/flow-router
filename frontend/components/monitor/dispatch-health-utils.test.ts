@@ -2,7 +2,8 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   chunkDispatchGroups,
-  DISPATCH_WINDOW_OPTIONS,
+  DISPATCH_RANGE_OPTIONS,
+  dispatchRangeMinutes,
   failureRateTone,
   metricBarPercent,
   formatDispatchRouteMetric,
@@ -13,7 +14,7 @@ import {
   isDispatchRouteNavigable,
   formatFailureRate,
   formatFirstToken,
-  formatScoreRouteIdentity,
+  formatRouteIdentity,
   formatTTFT,
 } from "./dispatch-health-utils.ts"
 
@@ -36,11 +37,20 @@ test("normalizes metric bars to a bounded percentage", () => {
   assert.equal(metricBarPercent(null, 1600), 0)
 })
 
-test("dispatch windows stay in the supported order", () => {
+test("dispatch ranges stay in the supported order and resolve to minutes", () => {
   assert.deepEqual(
-    DISPATCH_WINDOW_OPTIONS.map((item) => item.value),
+    DISPATCH_RANGE_OPTIONS.map((item) => item.value),
     ["1m", "5m", "30m", "1h", "4h", "8h", "12h", "24h"],
   )
+  // 档位标签和分钟数必须对得上——写错了窗口会静默取错区间，页面上看不出来
+  assert.deepEqual(
+    DISPATCH_RANGE_OPTIONS.map((item) => item.minutes),
+    [1, 5, 30, 60, 240, 480, 720, 1440],
+  )
+  assert.equal(dispatchRangeMinutes("30m"), 30)
+  assert.equal(dispatchRangeMinutes("24h"), 1440)
+  // 未知档位退回 1 小时，而不是 NaN（NaN 会让 from 变成 Invalid Date）
+  assert.equal(dispatchRangeMinutes("99h" as never), 60)
 })
 
 test("formats failure rates and severity", () => {
@@ -90,18 +100,18 @@ test("only links routes that still exist in the current gateway config", () => {
 
 test("route identity prefers source and source group over the key name", () => {
   assert.equal(
-    formatScoreRouteIdentity({ source_name: "55", source_group_name: "GPT-特惠-Plus", key_name: "uops-ch9-sgn-GPT-3d50", route_id: 7 }),
+    formatRouteIdentity({ source_name: "55", source_group_name: "GPT-特惠-Plus", key_name: "uops-ch9-sgn-GPT-3d50", route_id: 7 }),
     "55 · GPT-特惠-Plus",
   )
-  assert.equal(formatScoreRouteIdentity({ source_name: "55", route_id: 7 }), "55")
-  assert.equal(formatScoreRouteIdentity({ source_group_name: "GPT-特惠-Plus", route_id: 7 }), "GPT-特惠-Plus")
+  assert.equal(formatRouteIdentity({ source_name: "55", route_id: 7 }), "55")
+  assert.equal(formatRouteIdentity({ source_group_name: "GPT-特惠-Plus", route_id: 7 }), "GPT-特惠-Plus")
 })
 
 test("route identity falls back to the key name, then the route id", () => {
-  assert.equal(formatScoreRouteIdentity({ key_name: "uops-ch9-3d50", route_id: 7 }), "uops-ch9-3d50")
-  assert.equal(formatScoreRouteIdentity({ route_id: 7 }), "路由 #7")
+  assert.equal(formatRouteIdentity({ key_name: "uops-ch9-3d50", route_id: 7 }), "uops-ch9-3d50")
+  assert.equal(formatRouteIdentity({ route_id: 7 }), "路由 #7")
   // 全是空白串时也要退到 id，而不是显示一串空格
-  assert.equal(formatScoreRouteIdentity({ source_name: "  ", source_group_name: "", key_name: " ", route_id: 7 }), "路由 #7")
+  assert.equal(formatRouteIdentity({ source_name: "  ", source_group_name: "", key_name: " ", route_id: 7 }), "路由 #7")
 })
 
 test("TTFT formats by magnitude and marks missing samples", () => {

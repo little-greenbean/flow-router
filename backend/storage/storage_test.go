@@ -3,6 +3,7 @@ package storage
 import (
 	"math"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1356,10 +1357,10 @@ func TestGatewayUsageDispatchErrorsRejectsBadRange(t *testing.T) {
 	}
 }
 
-func TestGatewayUsageDispatchScorecardRanksRoutes(t *testing.T) {
+func TestGatewayUsageDispatchAttentionGroupsByGateway(t *testing.T) {
 	db := openTestDB(t)
 	usage := NewGatewayUsageLogs(db)
-	if err := db.Create(&GatewayGroup{ID: 31, Name: "记分卡网关"}).Error; err != nil {
+	if err := db.Create(&GatewayGroup{ID: 31, Name: "建议关注网关"}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Create(&Channel{ID: 7, Name: "渠道七", Type: ChannelTypeNewAPI, SiteURL: "https://x", Username: "u"}).Error; err != nil {
@@ -1373,16 +1374,16 @@ func TestGatewayUsageDispatchScorecardRanksRoutes(t *testing.T) {
 	to := from.Add(10 * time.Minute)
 	ttft := func(ms int64) *int64 { return &ms }
 	rows := []GatewayUsageLog{
-		// sc-1：路由 11 因 403 失败（P0，需人工），顺延到路由 12 成功 → 链顺延 1 次
+		// sc-1：路由 11 因 403 失败（P0，需人工），顺延到路由 12 成功 → 链顺延 1 次、最终成功
 		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceGroupName: "源组A", SourceAPIKeyName: "uops-key-a", RequestID: "sc-1", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 403, ErrorMessage: "余额不足", CreatedAt: from.Add(10 * time.Second)},
 		{GatewayGroupID: 31, RouteID: 12, ProviderName: "供应商B", SourceGroupName: "源组B", SourceAPIKeyName: "uops-key-b", RequestID: "sc-1", Attempt: 2, AttemptKind: "failover", Success: true, FirstTokenMS: ttft(800), CreatedAt: from.Add(11 * time.Second)},
 		// sc-2：路由 11 再次 403 → 顺延两次才成功，链顺延 2 次
 		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceAPIKeyName: "uops-key-a", RequestID: "sc-2", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 403, ErrorMessage: "余额不足", CreatedAt: from.Add(1 * time.Minute)},
 		{GatewayGroupID: 31, RouteID: 12, RequestID: "sc-2", Attempt: 2, AttemptKind: "failover", Success: false, ErrorType: "http", StatusCode: 502, ErrorMessage: "网关错误", CreatedAt: from.Add(61 * time.Second)},
 		{GatewayGroupID: 31, RouteID: 12, RequestID: "sc-2", Attempt: 3, AttemptKind: "failover", Success: true, FirstTokenMS: ttft(1200), CreatedAt: from.Add(62 * time.Second)},
-		// sc-3：路由 11 成功一次
+		// sc-3：路由 11 成功一次 → 打断连败
 		{GatewayGroupID: 31, RouteID: 11, ChannelID: 7, RequestID: "sc-3", Attempt: 1, Success: true, FirstTokenMS: ttft(400), CreatedAt: from.Add(2 * time.Minute)},
-		// sc-4：路由 12 被客户端断开（P2，噪声）
+		// sc-4：路由 12 被客户端断开（P2，噪声），且这条链没顺延、最终失败
 		{GatewayGroupID: 31, RouteID: 12, RequestID: "sc-4", Attempt: 1, Success: false, ErrorType: "client", StatusCode: 499, ErrorMessage: "客户端断开", CreatedAt: from.Add(3 * time.Minute)},
 	}
 	for i := range rows {
@@ -1391,17 +1392,43 @@ func TestGatewayUsageDispatchScorecardRanksRoutes(t *testing.T) {
 		}
 	}
 
-	got, err := usage.DispatchScorecard(from, to)
+	got, err := usage.DispatchAttention(from, to)
 	if err != nil {
-		t.Fatalf("dispatch scorecard: %v", err)
+		t.Fatalf("dispatch attention: %v", err)
 	}
-	if len(got.Routes) != 2 {
-		t.Fatalf("routes = %d, want 2", len(got.Routes))
+	if len(got.Groups) != 1 {
+		t.Fatalf("groups = %d, want 1", len(got.Groups))
 	}
-	// P0 最多的排最前面 → 路由 11（两次 403）
-	first := got.Routes[0]
+	group := got.Groups[0]
+	if group.GatewayGroupID != 31 || group.GatewayGroupName != "建议关注网关" {
+		t.Fatalf("group = %d/%q, want 31/建议关注网关", group.GatewayGroupID, group.GatewayGroupName)
+	}
+	// 链级：4 条请求，其中 sc-1/sc-2 顺延过，sc-4 最终失败
+	if group.Requests != 4 || group.FailoverRequests != 2 || group.FailedRequests != 1 {
+		t.Fatalf("group chains = %d/%d/%d, want 4/2/1", group.Requests, group.FailoverRequests, group.FailedRequests)
+	}
+	if math.Abs(group.RequestFailoverRate-0.5) > 1e-9 {
+		t.Fatalf("group request failover rate = %v, want 0.5", group.RequestFailoverRate)
+	}
+	// 尝试级仍然按尝试算，别跟链级混
+	if group.Attempts != 7 || group.FailedAttempts != 4 {
+		t.Fatalf("group attempts = %d/%d, want 7/4", group.Attempts, group.FailedAttempts)
+	}
+	if group.Severity.P0 != 2 || group.Severity.P1 != 1 || group.Severity.P2 != 1 {
+		t.Fatalf("group severity = %+v, want P0=2/P1=1/P2=1", group.Severity)
+	}
+	// 网关健康取组内最差的路由
+	if group.Health != "action" {
+		t.Fatalf("group health = %q, want action", group.Health)
+	}
+	if len(group.Routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(group.Routes))
+	}
+
+	// P0 多的排前面 → 路由 11
+	first := group.Routes[0]
 	if first.RouteID != 11 {
-		t.Fatalf("first route = %d, want 11 (P0 最多)", first.RouteID)
+		t.Fatalf("first route = %d, want 11", first.RouteID)
 	}
 	if first.Severity.P0 != 2 || first.Severity.P1 != 0 || first.Severity.P2 != 0 {
 		t.Fatalf("route 11 severity = %+v, want P0=2", first.Severity)
@@ -1415,6 +1442,11 @@ func TestGatewayUsageDispatchScorecardRanksRoutes(t *testing.T) {
 	// 路由 11 失败所在的链最深顺延 2 次（sc-2）
 	if first.MaxFailoverDepth != 2 {
 		t.Fatalf("route 11 max failover depth = %d, want 2", first.MaxFailoverDepth)
+	}
+	// 连败按「这条路由自己的尝试序列」算，中间夹着别的路由不算打断：
+	// 路由 11 是 败-败-成 → 最长 2，末尾是成功 → 当前 0
+	if first.MaxFailStreak != 2 || first.CurrentFailStreak != 0 {
+		t.Fatalf("route 11 streak = %d/%d, want max 2 / current 0", first.MaxFailStreak, first.CurrentFailStreak)
 	}
 	// 身份：来源取渠道名，源分组取日志快照，而不是密钥名
 	if first.SourceName != "渠道七" || first.SourceGroupName != "源组A" {
@@ -1432,8 +1464,18 @@ func TestGatewayUsageDispatchScorecardRanksRoutes(t *testing.T) {
 	if first.Requests != 3 {
 		t.Fatalf("route 11 requests = %d, want 3", first.Requests)
 	}
+	// 最近请求状态按时间正序，成功那次在最后
+	if len(first.Recent) != 3 {
+		t.Fatalf("route 11 recent = %d, want 3", len(first.Recent))
+	}
+	if !first.Recent[2].Success || first.Recent[2].Severity != -1 {
+		t.Fatalf("route 11 last mark = %+v, want success", first.Recent[2])
+	}
+	if first.Recent[0].Success || first.Recent[0].Severity != dispatchSeverityP0 || first.Recent[0].StatusCode != 403 {
+		t.Fatalf("route 11 first mark = %+v, want failed P0 403", first.Recent[0])
+	}
 
-	second := got.Routes[1]
+	second := group.Routes[1]
 	if second.RouteID != 12 {
 		t.Fatalf("second route = %d, want 12", second.RouteID)
 	}
@@ -1453,20 +1495,59 @@ func TestGatewayUsageDispatchScorecardRanksRoutes(t *testing.T) {
 	if second.TTFTP95 < 1200 {
 		t.Fatalf("route 12 ttft p95 = %v, want >=1200", second.TTFTP95)
 	}
-	// 迷你折线固定份数
-	if len(second.Points) != dispatchScoreBuckets {
-		t.Fatalf("route 12 points = %d, want %d", len(second.Points), dispatchScoreBuckets)
+	// 窗口末尾那次是失败（sc-4 客户端断开）→ 当前连败 1
+	if second.CurrentFailStreak != 1 {
+		t.Fatalf("route 12 current fail streak = %d, want 1", second.CurrentFailStreak)
+	}
+
+	if got.Routes != 2 || got.ProblemRoutes != group.ProblemRoutes {
+		t.Fatalf("totals = %d routes / %d problem, group problem = %d", got.Routes, got.ProblemRoutes, group.ProblemRoutes)
+	}
+	if got.Severity.P0 != 2 {
+		t.Fatalf("total severity = %+v, want P0=2", got.Severity)
 	}
 }
 
-func TestGatewayUsageDispatchScorecardRejectsBadRange(t *testing.T) {
+func TestGatewayUsageDispatchAttentionKeepsOnlyRecentAttempts(t *testing.T) {
+	db := openTestDB(t)
+	usage := NewGatewayUsageLogs(db)
+	from := time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC)
+	to := from.Add(time.Hour)
+	total := dispatchRecentAttempts + 5
+	for i := 0; i < total; i++ {
+		row := GatewayUsageLog{
+			GatewayGroupID: 41, RouteID: 21, RequestID: "r-" + strconv.Itoa(i), Attempt: 1,
+			Success: true, CreatedAt: from.Add(time.Duration(i) * time.Second),
+		}
+		if err := usage.Create(&row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := usage.DispatchAttention(from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := got.Groups[0].Routes[0]
+	if route.Attempts != total {
+		t.Fatalf("attempts = %d, want %d", route.Attempts, total)
+	}
+	// 统计不截断，只有展示用的 Recent 截断，且留的是最新的那批
+	if len(route.Recent) != dispatchRecentAttempts {
+		t.Fatalf("recent = %d, want %d", len(route.Recent), dispatchRecentAttempts)
+	}
+	if !route.Recent[len(route.Recent)-1].Timestamp.Equal(from.Add(time.Duration(total-1) * time.Second)) {
+		t.Fatalf("recent tail = %v, want the newest attempt", route.Recent[len(route.Recent)-1].Timestamp)
+	}
+}
+
+func TestGatewayUsageDispatchAttentionRejectsBadRange(t *testing.T) {
 	db := openTestDB(t)
 	usage := NewGatewayUsageLogs(db)
 	now := time.Now().UTC()
-	if _, err := usage.DispatchScorecard(now, now); err == nil {
+	if _, err := usage.DispatchAttention(now, now); err == nil {
 		t.Fatal("zero-duration range should fail")
 	}
-	if _, err := usage.DispatchScorecard(time.Time{}, now); err == nil {
+	if _, err := usage.DispatchAttention(time.Time{}, now); err == nil {
 		t.Fatal("zero from should fail")
 	}
 }
@@ -1495,26 +1576,31 @@ func TestDispatchSeverityClassifiesByUrgency(t *testing.T) {
 	}
 }
 
-func TestDispatchRouteHealthUsesP0RateNotPresence(t *testing.T) {
+func TestDispatchRouteHealthUsesP0RateAndFailStreak(t *testing.T) {
 	sev := func(p0, p1, p2 int) GatewayDispatchSeverityCounts {
 		return GatewayDispatchSeverityCounts{P0: p0, P1: p1, P2: p2}
 	}
 	cases := []struct {
 		name  string
-		route GatewayDispatchScoreRoute
+		route GatewayDispatchAttentionRoute
 		want  string
 	}{
 		// 370 次尝试里 1 次 P0（0.27%）：值得看一眼，但不该跟大面积 P0 同级
-		{"偶发 P0 只算关注", GatewayDispatchScoreRoute{Attempts: 370, Severity: sev(1, 0, 0)}, "watch"},
+		{"偶发 P0 只算关注", GatewayDispatchAttentionRoute{Attempts: 370, Severity: sev(1, 0, 0)}, "watch"},
 		// 370 次里 6 次 P0（1.6%）：够格了
-		{"P0 占比过线算需处理", GatewayDispatchScoreRoute{Attempts: 370, Severity: sev(6, 0, 0)}, "action"},
-		{"顺延率过半算需处理", GatewayDispatchScoreRoute{Attempts: 100, FailoverRate: 0.5}, "action"},
-		{"顺延率双位数算关注", GatewayDispatchScoreRoute{Attempts: 100, FailoverRate: 0.1}, "watch"},
-		{"首字过慢算关注", GatewayDispatchScoreRoute{Attempts: 100, TTFTP95: 10_001}, "watch"},
-		{"干净路由是健康", GatewayDispatchScoreRoute{Attempts: 100, FailoverRate: 0.05, TTFTP95: 900}, "ok"},
+		{"P0 占比过线算需处理", GatewayDispatchAttentionRoute{Attempts: 370, Severity: sev(6, 0, 0)}, "action"},
+		{"顺延率过半算需处理", GatewayDispatchAttentionRoute{Attempts: 100, FailoverRate: 0.5}, "action"},
+		{"顺延率双位数算关注", GatewayDispatchAttentionRoute{Attempts: 100, FailoverRate: 0.1}, "watch"},
+		{"首字过慢算关注", GatewayDispatchAttentionRoute{Attempts: 100, TTFTP95: 10_001}, "watch"},
+		// 连败是「正在挂」的信号：20% 失败率散着出现是抖动，末尾连着 5 次就是挂了
+		{"末尾连败到线算需处理", GatewayDispatchAttentionRoute{Attempts: 100, CurrentFailStreak: 5}, "action"},
+		{"末尾连败三次算关注", GatewayDispatchAttentionRoute{Attempts: 100, CurrentFailStreak: 3}, "watch"},
+		// 历史上连败过但现在恢复了，不该继续标红
+		{"连败已恢复不标红", GatewayDispatchAttentionRoute{Attempts: 100, MaxFailStreak: 9, CurrentFailStreak: 0}, "ok"},
+		{"干净路由是健康", GatewayDispatchAttentionRoute{Attempts: 100, FailoverRate: 0.05, TTFTP95: 900}, "ok"},
 		// P1/P2 再多也不该把整体健康的路由标红，否则标记会失去意义
-		{"只有抖动和噪声不升级", GatewayDispatchScoreRoute{Attempts: 100, Severity: sev(0, 40, 40)}, "ok"},
-		{"零尝试不该除零", GatewayDispatchScoreRoute{Attempts: 0, Severity: sev(0, 0, 0)}, "ok"},
+		{"只有抖动和噪声不升级", GatewayDispatchAttentionRoute{Attempts: 100, Severity: sev(0, 40, 40)}, "ok"},
+		{"零尝试不该除零", GatewayDispatchAttentionRoute{Attempts: 0, Severity: sev(0, 0, 0)}, "ok"},
 	}
 	for _, tc := range cases {
 		if got := dispatchRouteHealth(tc.route); got != tc.want {

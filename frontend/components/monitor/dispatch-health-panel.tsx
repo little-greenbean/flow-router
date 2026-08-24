@@ -2,22 +2,29 @@
 
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Link } from "react-router-dom"
-import { Activity } from "lucide-react"
+import { Activity, ChevronRight } from "lucide-react"
 import * as echarts from "echarts"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { useGatewayDispatchErrors, useGatewayDispatchScorecard } from "@/lib/queries"
+import { useGatewayDispatchAttention, useGatewayDispatchErrors } from "@/lib/queries"
 import { useRefreshTick } from "@/lib/refresh-context"
 import type {
   DispatchHealth,
+  GatewayDispatchAttempt,
+  GatewayDispatchAttentionGroup,
+  GatewayDispatchAttentionRoute,
   GatewayDispatchErrorScope,
-  GatewayDispatchScorePoint,
+  GatewayDispatchWindow,
 } from "@/lib/api-types"
 import {
+  DISPATCH_RANGE_OPTIONS,
   NEEDS_ACTION_FAILOVER,
+  NEEDS_ACTION_FAIL_STREAK,
   WATCH_FAILOVER,
+  WATCH_FAIL_STREAK,
   WATCH_TTFT_MS,
+  dispatchRangeMinutes,
   dispatchRoutePath,
-  formatScoreRouteIdentity,
+  formatRouteIdentity,
   formatTTFT,
 } from "@/components/monitor/dispatch-health-utils"
 import { cn } from "@/lib/utils"
@@ -25,9 +32,9 @@ import { cn } from "@/lib/utils"
 /**
  * 调度情况面板。
  *
- * 这里刻意不做通用趋势浏览器，而是围绕一个具体决策组织信息：**这条路由该不该禁掉**。
- * 所以主体是按路由横向铺开的记分卡（路由之间的比较才是决策依据），时间维度退化成
- * 每行一条迷你折线交代走向；下半部分保留错误下钻，用来回答「到底错在哪」。
+ * 组织方式跟着运维动作走：网关是操作单位（一个网关一组备选路由），所以「建议关注」
+ * 先按网关折叠，展开才看是哪条路由在拖后腿，最后用「最近请求状态」把抽象的百分比
+ * 落到一格一格具体的尝试上。下半部分保留错误下钻，回答「到底错在哪」。
  */
 
 const EMPTY_ERROR_SCOPE: GatewayDispatchErrorScope = {
@@ -47,13 +54,7 @@ const SEVERITY_META = [
   { key: "p2" as const, label: "P2", hint: "噪声：客户端主动断开或取消，通常不用管", color: "#98a3b4" },
 ]
 
-const WINDOWS = [
-  { hours: 1, label: "近 1 小时" },
-  { hours: 6, label: "近 6 小时" },
-  { hours: 24, label: "近 24 小时" },
-]
-
-type SparkMode = "failover" | "ttft"
+const SUCCESS_COLOR = "#3f9d6a"
 
 const HEALTH_META: Record<DispatchHealth, { mark: string; label: string; className: string }> = {
   action: { mark: "▲", label: "需处理", className: "text-danger" },
@@ -61,44 +62,172 @@ const HEALTH_META: Record<DispatchHealth, { mark: string; label: string; classNa
   ok: { mark: "○", label: "健康", className: "text-success" },
 }
 
+const ATTEMPT_KIND_LABEL: Record<string, string> = {
+  primary: "首发", retry: "重试", failover: "顺延",
+}
+
+function severityColor(severity: number): string {
+  return SEVERITY_META[severity]?.color ?? SUCCESS_COLOR
+}
+
+function formatClock(iso: string): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return iso
+  return date.toLocaleTimeString("zh-CN", { hour12: false })
+}
+
+function attemptTitle(mark: GatewayDispatchAttempt): string {
+  const kind = ATTEMPT_KIND_LABEL[mark.attempt_kind ?? "primary"] ?? mark.attempt_kind ?? ""
+  const head = [formatClock(mark.timestamp), kind, mark.success ? "成功" : (SEVERITY_META[mark.severity]?.label ?? "失败")]
+  if (mark.status_code) head.push(String(mark.status_code))
+  const tail: string[] = []
+  if (mark.model) tail.push(mark.model)
+  if (mark.first_token_ms) tail.push(`首字 ${formatTTFT(mark.first_token_ms)}`)
+  if (mark.message) tail.push(mark.message)
+  return tail.length > 0 ? `${head.join(" · ")}\n${tail.join("\n")}` : head.join(" · ")
+}
+
 /**
- * 迷你折线。用内联 SVG 而不是 ECharts 实例：一屏可能有几十行，
- * 每行开一个图表实例既慢又占内存，而这里只需要交代走向。
+ * 最近请求状态条：一格一次尝试，左旧右新。
  *
- * 纵轴刻度由外部统一传入（顺延率固定 0~100%，TTFT 取全表最大值），
- * 这样各行之间可以直接横向比高低——否则每行自适应缩放，图形好看但没法比。
+ * 这比趋势折线更适合当前这个决策——折线把「20% 失败率」摊平成一条线，看不出
+ * 那 20% 是均匀散着（抖动）还是连着一片（挂了）。一格一格摆出来，连败一眼可见。
  */
-function Sparkline({ points, mode, max }: { points: GatewayDispatchScorePoint[]; mode: SparkMode; max: number }) {
-  const width = 72
-  const height = 20
-  const segments: string[] = []
-  let current: string[] = []
-
-  points.forEach((point, index) => {
-    // 该时间桶没有任何尝试 → 断线，而不是画成 0（0 会被误读成"很健康"）
-    if (point.attempts === 0) {
-      if (current.length > 1) segments.push(current.join(" "))
-      current = []
-      return
-    }
-    const raw = mode === "failover" ? point.failover_rate : point.ttft_p95
-    const ratio = max > 0 ? Math.min(1, raw / max) : 0
-    const x = points.length > 1 ? (index / (points.length - 1)) * width : width / 2
-    const y = height - ratio * (height - 2) - 1
-    current.push(`${x.toFixed(1)},${y.toFixed(1)}`)
-  })
-  if (current.length > 1) segments.push(current.join(" "))
-
-  const stroke = mode === "failover" ? "#c45050" : "#2878bd"
+function RecentStrip({ marks }: { marks: GatewayDispatchAttempt[] }) {
+  if (marks.length === 0) {
+    return <span className="text-[10px] text-muted-foreground">窗口内无尝试</span>
+  }
   return (
-    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="shrink-0" aria-hidden>
-      <line x1={0} y1={height - 1} x2={width} y2={height - 1} stroke="currentColor" strokeOpacity={0.12} strokeWidth={1} />
-      {segments.length === 0
-        ? <text x={width / 2} y={height / 2 + 3} textAnchor="middle" fontSize={8} fill="currentColor" fillOpacity={0.35}>无数据</text>
-        : segments.map((segment, index) => (
-            <polyline key={index} points={segment} fill="none" stroke={stroke} strokeWidth={1.2} strokeLinejoin="round" strokeLinecap="round" />
-          ))}
-    </svg>
+    <span className="inline-flex flex-wrap items-center gap-[2px]">
+      {marks.map((mark, index) => (
+        <span
+          key={`${mark.timestamp}-${index}`}
+          title={attemptTitle(mark)}
+          className="h-3.5 w-2 rounded-[1px]"
+          style={{ backgroundColor: mark.success ? SUCCESS_COLOR : severityColor(mark.severity), opacity: mark.success ? 0.55 : 1 }}
+        />
+      ))}
+    </span>
+  )
+}
+
+function SeverityCounts({ severity, className }: { severity: { p0: number; p1: number; p2: number }; className?: string }) {
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 tabular-nums", className)}>
+      {SEVERITY_META.map((item) => {
+        const value = severity[item.key]
+        return (
+          <span key={item.key} title={item.hint} className={cn(value === 0 && "text-muted-foreground/40")}
+            style={value > 0 ? { color: item.color } : undefined}>
+            {item.label} {value}
+          </span>
+        )
+      })}
+    </span>
+  )
+}
+
+/** 展开后的一条路由：身份 + 指标 + 最近请求状态。 */
+function AttentionRoute({ route }: { route: GatewayDispatchAttentionRoute }) {
+  const meta = HEALTH_META[route.health] ?? HEALTH_META.ok
+  const identity = formatRouteIdentity(route)
+  return (
+    <div className="border-t border-border/50 px-2 py-1.5 first:border-t-0">
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className={cn("text-[10px]", meta.className)} title={meta.label}>{meta.mark}</span>
+        {route.alive ? (
+          // 深链接：网关页会切到对应组的路由标签、滚动定位并短暂高亮
+          <Link to={dispatchRoutePath(route.gateway_group_id, route.route_id)}
+            className="max-w-[300px] truncate text-[11px] font-medium text-brand hover:underline"
+            title={`${identity} — 点击跳转到该路由`}>
+            {identity}
+          </Link>
+        ) : (
+          <span className="max-w-[300px] truncate text-[11px] font-medium text-muted-foreground" title={`${identity}（路由已删除）`}>
+            {identity}
+          </span>
+        )}
+        <span className="text-[10px] text-muted-foreground">
+          {!route.alive ? "已删除 · " : !route.enabled ? "已禁用 · " : ""}
+          {route.attempts} 次尝试 / {route.requests} 请求
+        </span>
+      </div>
+
+      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
+        <span title="该路由失败并触发重试/顺延的尝试占比">
+          顺延率{" "}
+          <b className={cn("tabular-nums", route.failover_rate >= NEEDS_ACTION_FAILOVER ? "text-danger" : route.failover_rate >= WATCH_FAILOVER ? "text-warning" : "text-foreground")}>
+            {(route.failover_rate * 100).toFixed(1)}%
+          </b>
+        </span>
+        <span title="窗口末尾还连着败几次 / 窗口内最长的一段连败">
+          连败{" "}
+          <b className={cn("tabular-nums", route.current_fail_streak >= NEEDS_ACTION_FAIL_STREAK ? "text-danger" : route.current_fail_streak >= WATCH_FAIL_STREAK ? "text-warning" : "text-foreground")}>
+            {route.current_fail_streak}
+          </b>
+          <span className="text-muted-foreground/70"> 次（最长 {route.max_fail_streak}）</span>
+        </span>
+        <span title="该路由失败所在的请求链里，顺延次数最多的那条链顺延了几次">
+          连深 <b className={cn("tabular-nums", route.max_failover_depth >= 2 ? "text-danger" : "text-foreground")}>{route.max_failover_depth}</b>
+        </span>
+        <span title="首字节耗时 P95">
+          TTFT95 <b className={cn("tabular-nums", route.ttft_p95 > WATCH_TTFT_MS ? "text-warning" : "text-foreground")}>{formatTTFT(route.ttft_p95)}</b>
+        </span>
+        <SeverityCounts severity={route.severity} />
+      </div>
+
+      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="text-[10px] text-muted-foreground">最近</span>
+        <RecentStrip marks={route.recent} />
+        {route.top_error ? (
+          <span className="max-w-[420px] truncate text-[10px] text-muted-foreground" title={route.top_error}>{route.top_error}</span>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
+/** 一个网关的折叠行。收起时只给「要不要展开」需要的信息。 */
+function AttentionGroup({
+  group, open, onToggle, showHealthy,
+}: {
+  group: GatewayDispatchAttentionGroup
+  open: boolean
+  onToggle: () => void
+  showHealthy: boolean
+}) {
+  const meta = HEALTH_META[group.health] ?? HEALTH_META.ok
+  const visible = showHealthy ? group.routes : group.routes.filter((route) => route.health !== "ok")
+  return (
+    <div className="rounded-md border border-border/70">
+      <button type="button" onClick={onToggle} aria-expanded={open}
+        className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-2 py-1.5 text-left hover:bg-muted/30">
+        <ChevronRight className={cn("size-3 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")} />
+        <span className={cn("text-[10px]", meta.className)} title={meta.label}>{meta.mark}</span>
+        <span className="min-w-0 flex-1 truncate text-[11px] font-medium" title={group.gateway_group_name}>{group.gateway_group_name}</span>
+        <span className="text-[10px] text-muted-foreground" title="窗口内至少顺延过一次的请求占比（链级：一条请求算一次，不管跨了几条路由）">
+          顺延请求{" "}
+          <b className={cn("tabular-nums", group.request_failover_rate >= NEEDS_ACTION_FAILOVER ? "text-danger" : group.request_failover_rate >= WATCH_FAILOVER ? "text-warning" : "text-foreground")}>
+            {(group.request_failover_rate * 100).toFixed(1)}%
+          </b>
+          <span className="text-muted-foreground/70"> {group.failover_requests}/{group.requests}</span>
+        </span>
+        <span className="text-[10px] text-muted-foreground" title="顺延完仍然没救回来的请求数">
+          最终失败 <b className={cn("tabular-nums", group.failed_requests > 0 ? "text-danger" : "text-foreground")}>{group.failed_requests}</b>
+        </span>
+        <SeverityCounts severity={group.severity} className="text-[10px]" />
+        <span className="text-[10px] tabular-nums text-muted-foreground">
+          问题路由 <b className={group.problem_routes > 0 ? "text-warning" : "text-foreground"}>{group.problem_routes}</b>/{group.routes.length}
+        </span>
+      </button>
+      {open ? (
+        <div className="border-t border-border/70 bg-muted/10">
+          {visible.length === 0
+            ? <p className="px-2 py-2 text-[10px] text-muted-foreground">该网关下没有需要关注的路由（勾选「含健康路由」可看全部 {group.routes.length} 条）</p>
+            : visible.map((route) => <AttentionRoute key={route.route_id} route={route} />)}
+        </div>
+      ) : null}
+    </div>
   )
 }
 
@@ -140,48 +269,41 @@ function errorPieOption(data: GatewayDispatchErrorScope) {
 }
 
 export function DispatchHealthPanel() {
-  const [windowHours, setWindowHours] = useState(6)
-  const [sparkMode, setSparkMode] = useState<SparkMode>("failover")
+  const [rangeValue, setRangeValue] = useState<GatewayDispatchWindow>("1h")
+  const [showHealthy, setShowHealthy] = useState(false)
+  // null = 还没手动点过，用默认展开（最该处理的那个网关）
+  const [openGroups, setOpenGroups] = useState<number[] | null>(null)
   const [errorGatewayID, setErrorGatewayID] = useState<number | null>(null)
   const [errorRouteID, setErrorRouteID] = useState<number | null>(null)
   const tick = useRefreshTick()
 
-  // 跟着全局刷新 tick 一起前滚，窗口才是"最近 N 小时"而不是"打开页面那一刻起的 N 小时"
+  // 跟着全局刷新 tick 一起前滚，窗口才是"最近 N"而不是"打开页面那一刻起的 N"
   const range = useMemo(() => {
     const to = new Date()
-    const from = new Date(to.getTime() - windowHours * 3600_000)
+    const from = new Date(to.getTime() - dispatchRangeMinutes(rangeValue) * 60_000)
     return { from: from.toISOString(), to: to.toISOString() }
-  }, [windowHours, tick])
+  }, [rangeValue, tick])
 
-  const scorecard = useGatewayDispatchScorecard(range.from, range.to)
+  const attention = useGatewayDispatchAttention(range.from, range.to)
   const errors = useGatewayDispatchErrors(range.from, range.to)
-  const routes = useMemo(() => scorecard.data?.routes ?? [], [scorecard.data])
+  const groups = useMemo(() => attention.data?.groups ?? [], [attention.data])
   const errorData = errors.data
 
-  /**
-   * 迷你线的纵轴上限：两种模式都取「全表最大值」而不是各行自适应——
-   * 各行自适应画出来好看，但行与行没法比高低，记分卡就失去意义了。
-   *
-   * 顺延率不用固定 0~100%：实际值常年在个位数百分比，贴着底边画等于没画。
-   * 用 5% 兜底，避免全表都接近 0 时把噪声放大成大起大落。
-   */
-  const sparkMax = useMemo(() => {
-    let failover = 0
-    let ttft = 0
-    for (const route of routes) {
-      for (const point of route.points) {
-        if (point.failover_rate > failover) failover = point.failover_rate
-        if (point.ttft_p95 > ttft) ttft = point.ttft_p95
-      }
-    }
-    return { failover: Math.max(failover, 0.05), ttft }
-  }, [routes])
+  // 默认展开排第一的网关（排序已经保证它最该处理），手动点过之后完全交给用户
+  const effectiveOpen = useMemo(() => {
+    if (openGroups != null) return new Set(openGroups)
+    const first = groups.find((group) => group.problem_routes > 0) ?? groups[0]
+    return new Set(first ? [first.gateway_group_id] : [])
+  }, [openGroups, groups])
 
-  const counts = useMemo(() => {
-    const result = { action: 0, watch: 0, ok: 0 }
-    for (const route of routes) result[route.health]++
-    return result
-  }, [routes])
+  const toggleGroup = (id: number) => {
+    setOpenGroups((current) => {
+      const next = new Set(current ?? effectiveOpen)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return [...next]
+    })
+  }
 
   const errorRef = useRef<HTMLDivElement | null>(null)
   const errorChart = useRef<echarts.ECharts | null>(null)
@@ -226,10 +348,10 @@ export function DispatchHealthPanel() {
         <Activity className="size-3.5 text-brand" />调度情况
       </CardTitle>
       <div className="flex flex-wrap items-center justify-end gap-1.5">
-        <div className="inline-flex rounded-md border border-border bg-muted/30 p-0.5">
-          {WINDOWS.map((item) => (
-            <button key={item.hours} type="button" onClick={() => setWindowHours(item.hours)}
-              className={cn("h-6 rounded px-2 text-[11px]", windowHours === item.hours ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
+        <div className="inline-flex flex-wrap rounded-md border border-border bg-muted/30 p-0.5">
+          {DISPATCH_RANGE_OPTIONS.map((item) => (
+            <button key={item.value} type="button" onClick={() => setRangeValue(item.value)}
+              className={cn("h-6 rounded px-1.5 text-[11px]", rangeValue === item.value ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
               {item.label}
             </button>
           ))}
@@ -239,103 +361,32 @@ export function DispatchHealthPanel() {
     </CardHeader>
 
     <CardContent className="px-3 pb-2 sm:px-4">
-      {/* ---- 路由健康记分卡 ---- */}
+      {/* ---- 建议关注 ---- */}
       <div className="mb-1.5 flex h-6 flex-wrap items-center justify-between gap-2">
-        <h3 className="text-xs font-semibold">路由健康（最该处理的排前面）</h3>
+        <h3 className="text-xs font-semibold">建议关注</h3>
         <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-          <span><span className="text-danger">▲</span> 需处理 {counts.action}</span>
-          <span><span className="text-warning">●</span> 关注 {counts.watch}</span>
-          <span><span className="text-success">○</span> 健康 {counts.ok}</span>
-          <div className="inline-flex rounded border border-border bg-muted/30 p-0.5">
-            {([["failover", "顺延率"], ["ttft", "TTFT"]] as const).map(([value, label]) => (
-              <button key={value} type="button" onClick={() => setSparkMode(value)}
-                className={cn("rounded px-1.5 py-0.5", sparkMode === value ? "bg-background font-medium text-foreground shadow-sm" : "")}>
-                {label}
-              </button>
-            ))}
-          </div>
+          <span>
+            <span className="text-danger">▲</span> 需处理 / <span className="text-warning">●</span> 关注：
+            <b className="tabular-nums text-foreground"> {attention.data?.problem_routes ?? 0}</b> / {attention.data?.routes ?? 0} 条路由
+          </span>
+          <label className="inline-flex cursor-pointer items-center gap-1">
+            <input type="checkbox" className="size-3 accent-current" checked={showHealthy} onChange={(event) => setShowHealthy(event.target.checked)} />
+            含健康路由
+          </label>
         </div>
       </div>
 
-      {scorecard.error
-        ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-[11px] text-danger">记分卡加载失败：{scorecard.error}</p>
-        : !scorecard.data
+      {attention.error
+        ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-[11px] text-danger">建议关注加载失败：{attention.error}</p>
+        : !attention.data
         ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">加载中…</div>
-        : routes.length === 0
+        : groups.length === 0
         ? <div className="flex h-44 items-center justify-center rounded-md border border-border/70 bg-muted/20 text-[11px] text-muted-foreground">当前窗口没有调度记录</div>
-        : <div className="max-h-80 overflow-auto rounded-md border border-border/70">
-            <table className="w-full min-w-[720px] border-collapse text-[11px]">
-              <thead className="sticky top-0 z-10 bg-muted/60 backdrop-blur">
-                <tr className="text-[10px] text-muted-foreground">
-                  <th className="px-2 py-1.5 text-left font-medium">路由（来源 · 源分组）</th>
-                  <th className="px-2 py-1.5 text-right font-medium" title="该路由失败并触发重试/顺延的尝试占比">顺延率</th>
-                  <th className="px-2 py-1.5 text-right font-medium" title="该路由失败所在的请求链里，顺延次数最多的那条链顺延了几次">连深</th>
-                  <th className="px-2 py-1.5 text-right font-medium" title="首字节耗时 P95">TTFT95</th>
-                  <th className="px-2 py-1.5 text-left font-medium" title="按处理紧急度分级">错误 P0/P1/P2</th>
-                  <th className="px-2 py-1.5 text-right font-medium">{sparkMode === "failover" ? "顺延率走向" : "TTFT 走向"}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {routes.map((route) => {
-                  const meta = HEALTH_META[route.health] ?? HEALTH_META.ok
-                  const identity = formatScoreRouteIdentity(route)
-                  return (
-                    <tr key={route.route_id} className="border-t border-border/60 hover:bg-muted/30">
-                      <td className="max-w-[280px] px-2 py-1.5">
-                        <div className="flex items-start gap-1.5">
-                          <span className={cn("mt-px shrink-0 text-[10px]", meta.className)} title={meta.label}>{meta.mark}</span>
-                          <span className="min-w-0">
-                            {route.alive ? (
-                              // 深链接：网关页会切到对应组的路由标签、滚动定位并短暂高亮
-                              <Link to={dispatchRoutePath(route.gateway_group_id, route.route_id)}
-                                className="block truncate font-medium text-brand hover:underline" title={`${identity} — 点击跳转到该路由`}>
-                                {identity}
-                              </Link>
-                            ) : (
-                              <span className="block truncate font-medium text-muted-foreground" title={`${identity}（路由已删除）`}>{identity}</span>
-                            )}
-                            <span className="block truncate text-[10px] text-muted-foreground">
-                              {route.gateway_group_name}
-                              {!route.alive ? " · 已删除" : !route.enabled ? " · 已禁用" : ""}
-                              {` · ${route.attempts} 次尝试`}
-                            </span>
-                          </span>
-                        </div>
-                      </td>
-                      <td className={cn("px-2 py-1.5 text-right tabular-nums", route.failover_rate >= NEEDS_ACTION_FAILOVER ? "font-semibold text-danger" : route.failover_rate >= WATCH_FAILOVER ? "text-warning" : "text-muted-foreground")}>
-                        {(route.failover_rate * 100).toFixed(1)}%
-                      </td>
-                      <td className={cn("px-2 py-1.5 text-right tabular-nums", route.max_failover_depth >= 2 ? "font-semibold text-danger" : "text-muted-foreground")}>
-                        {route.max_failover_depth}
-                      </td>
-                      <td className={cn("px-2 py-1.5 text-right tabular-nums", route.ttft_p95 > WATCH_TTFT_MS ? "font-semibold text-warning" : "text-muted-foreground")}>
-                        {formatTTFT(route.ttft_p95)}
-                      </td>
-                      <td className="px-2 py-1.5">
-                        <span className="flex items-center gap-1.5">
-                          {SEVERITY_META.map((severity) => {
-                            const value = route.severity[severity.key]
-                            return (
-                              <span key={severity.key} title={severity.hint}
-                                className={cn("tabular-nums", value === 0 && "text-muted-foreground/40")}
-                                style={value > 0 ? { color: severity.color } : undefined}>
-                                {severity.label} {value}
-                              </span>
-                            )
-                          })}
-                        </span>
-                        {route.top_error ? <span className="mt-0.5 block max-w-[260px] truncate text-[10px] text-muted-foreground" title={route.top_error}>{route.top_error}</span> : null}
-                      </td>
-                      <td className="px-2 py-1.5 text-right text-muted-foreground">
-                        <span className="inline-flex justify-end">
-                          <Sparkline points={route.points} mode={sparkMode} max={sparkMode === "failover" ? sparkMax.failover : sparkMax.ttft} />
-                        </span>
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
+        : <div className="max-h-[34rem] space-y-1 overflow-auto pr-0.5">
+            {groups.map((group) => (
+              <AttentionGroup key={group.gateway_group_id} group={group} showHealthy={showHealthy}
+                open={effectiveOpen.has(group.gateway_group_id)} onToggle={() => toggleGroup(group.gateway_group_id)} />
+            ))}
           </div>}
 
       {/* ---- 错误分布下钻 ---- */}
