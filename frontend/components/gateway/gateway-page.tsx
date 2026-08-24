@@ -1486,7 +1486,7 @@ export function GatewayPage() {
       } else if (res.all_ok) {
         toast.success(
           routeID != null
-            ? `可用 · ${items[0]?.label ?? ""} · ${items[0]?.latency_ms ?? 0}ms`
+            ? `可用 · ${items[0]?.label ?? ""} · 首字 ${items[0]?.latency_ms ?? 0}ms`
             : `全部可用 ${res.ok_count}/${res.total}`,
         )
       } else {

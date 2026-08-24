@@ -387,6 +387,29 @@ func (a *AdminService) SyncGroupModels(ctx context.Context, groupID uint, in Syn
 
 // TestModelInput 模型可用性探测。
 
+const (
+	// probeTimeout 单条探测的硬上限，含建连、等首字和收尾。
+	probeTimeout = 30 * time.Second
+	// probeFirstTokenDefault 没配组级首字超时时，探测自己的首字预算。
+	// 取 20s：实测这些 Kiro/Claude 中转真实流量首字均值 2~3 秒、长尾到 30s+，
+	// 20s 足够放过"慢但活着"的路由，又不会让一条死链把整批拖满 30 秒。
+	probeFirstTokenDefault = 20 * time.Second
+)
+
+// probeFirstTokenWait 探测的首字预算：组上配了就跟组走（跟真实调度同一个口径），
+// 没配用默认值；无论如何要给 probeTimeout 留出收尾的余量，否则首字超时还没触发
+// 就被 ctx 掐了，错误信息会退化成没什么信息量的 context deadline exceeded。
+func probeFirstTokenWait(group *storage.GatewayGroup) time.Duration {
+	wait := probeFirstTokenDefault
+	if group != nil && group.FirstTokenTimeoutSec > 0 {
+		wait = time.Duration(group.FirstTokenTimeoutSec) * time.Second
+	}
+	if max := probeTimeout - 5*time.Second; wait > max {
+		wait = max
+	}
+	return wait
+}
+
 func (a *AdminService) TestGroupModel(ctx context.Context, groupID uint, in TestModelInput) ([]ModelTestResult, error) {
 	model := strings.TrimSpace(in.Model)
 	if model == "" {
@@ -523,26 +546,39 @@ func (a *AdminService) probeRouteModel(
 		}
 	}
 	upstreamKind := protocol.ResolveUpstream(routeProto, inbound, upstreamModel)
-	// 探测 body 统一用 chat 形态，再按上游协议转换
+	// 探测 body 统一用 chat 形态，再按上游协议转换。
+	//
+	// 这里必须是**流式**：非流式时上游要把整条响应生成完才回第一个字节，而中转
+	// （尤其 Kiro 系）真实流量首字 2~3 秒就开始吐、整条却经常要十几秒、峰值上百秒。
+	// 用非流式探测等于拿"跑完全程"的耗时去判"这条路通不通"，一批实际可用的路由会被
+	// 判成 context deadline exceeded。改成流式后，拿到第一个字节就算通——跟真实
+	// 使用场景（客户端都是流式）也是同一个口径。
+	// 注意 stream 得同时给 body 和 prepareUpstreamRequest：同协议透传时用 body 里的，
+	// 跨协议转换时用参数（见 protocol.OpenAIToAnthropicRequest 的 out["stream"]=stream）。
 	chatBody := []byte(fmt.Sprintf(
-		`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"ping"}],"stream":false}`,
+		`{"model":%q,"max_tokens":1,"messages":[{"role":"user","content":"ping"}],"stream":true}`,
 		upstreamModel,
 	))
-	body, path, _, convErr := a.prepareUpstreamRequest(chatBody, inbound, upstreamKind, upstreamModel, false, "/v1/chat/completions")
+	body, path, _, convErr := a.prepareUpstreamRequest(chatBody, inbound, upstreamKind, upstreamModel, true, "/v1/chat/completions")
 	if convErr != nil {
 		res.Error = "protocol convert: " + convErr.Error()
 		return res
 	}
 	res.UpstreamPath = path
 
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	ctx, cancel := context.WithTimeout(parent, probeTimeout)
 	defer cancel()
 	start := time.Now()
 	// 探测不走 gin 客户端上下文写回，使用空 Header（UA 由 target.UserAgentOverride 注入）
-	status, _, respBody, _, fwdErr := a.forwardOnce(
-		ctx, &gin.Context{}, target, path, http.MethodPost, http.Header{}, body, false, upstreamKind, 0,
+	status, _, respBody, firstTokenMS, fwdErr := a.forwardOnce(
+		ctx, &gin.Context{}, target, path, http.MethodPost, http.Header{}, body, true, upstreamKind,
+		probeFirstTokenWait(group),
 	)
 	res.LatencyMS = time.Since(start).Milliseconds()
+	// 判定看首字，报的耗时也该是首字——后面那点收尾读是探测自己的开销，不是体感
+	if firstTokenMS != nil && *firstTokenMS > 0 {
+		res.LatencyMS = *firstTokenMS
+	}
 	res.StatusCode = status
 	if fwdErr != nil {
 		res.Error = fwdErr.Error()

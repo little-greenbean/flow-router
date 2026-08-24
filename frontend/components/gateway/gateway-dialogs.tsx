@@ -218,7 +218,7 @@ export function ModelTestDialog({
                                 <div className="space-y-0.5 text-xs">
                                   <div className="inline-flex items-center gap-1 font-medium text-emerald-600 dark:text-emerald-400">
                                     <CheckCircle2 className="size-3.5 shrink-0" />
-                                    可用 · {tr.latency_ms}ms
+                                    可用 · 首字 {tr.latency_ms}ms
                                     {tr.status_code ? ` · HTTP ${tr.status_code}` : ""}
                                   </div>
                                 </div>

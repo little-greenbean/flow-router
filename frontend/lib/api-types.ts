@@ -725,6 +725,7 @@ export interface GatewayModelTestResult {
   upstream_path?: string
   ok: boolean
   status_code: number
+  /** 首字耗时：探测走流式，拿到第一个字节就算这条路通（跟客户端的真实体感同一个口径） */
   latency_ms: number
   error?: string
 }

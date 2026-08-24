@@ -289,7 +289,7 @@ export function ModelsPanel({
                                       <div>HTTP {tr.status_code}</div>
                                     ) : null}
                                     {tr.ok ? (
-                                      <div>延迟 {tr.latency_ms}ms</div>
+                                      <div>首字 {tr.latency_ms}ms</div>
                                     ) : tr.error ? (
                                       <div className="break-words text-destructive">
                                         {tr.error}
