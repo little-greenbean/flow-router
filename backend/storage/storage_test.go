@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1554,6 +1553,25 @@ func TestGatewayUsageDispatchFlowCollapsesDeepChains(t *testing.T) {
 	}
 }
 
+func TestGatewayUsageDispatchFlowListsGatewaysRegardlessOfDrill(t *testing.T) {
+	usage, from, to := dispatchFlowFixture(t)
+	// 下钻到 31 之后，tag 列表仍然要能看到 32——否则切不回去
+	flow, err := usage.DispatchFlow(from, to, 31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(flow.Gateways) != 2 {
+		t.Fatalf("gateways = %+v, want 2 (不受下钻过滤影响)", flow.Gateways)
+	}
+	// 流量大的排前面
+	if flow.Gateways[0].GatewayGroupID != 31 || flow.Gateways[0].Requests != 3 {
+		t.Fatalf("first gateway = %+v, want 31 / 3 requests", flow.Gateways[0])
+	}
+	if flow.Gateways[1].GatewayGroupID != 32 || flow.Gateways[1].Name != "备网关" || flow.Gateways[1].Requests != 1 {
+		t.Fatalf("second gateway = %+v", flow.Gateways[1])
+	}
+}
+
 func TestGatewayUsageDispatchFlowRejectsBadRange(t *testing.T) {
 	db := openTestDB(t)
 	usage := NewGatewayUsageLogs(db)
@@ -1563,72 +1581,6 @@ func TestGatewayUsageDispatchFlowRejectsBadRange(t *testing.T) {
 	}
 	if _, err := usage.DispatchFlow(time.Time{}, now, 0); err == nil {
 		t.Fatal("zero from should fail")
-	}
-}
-
-func TestGatewayUsageDispatchRawErrorsKeepsMessagesVerbatim(t *testing.T) {
-	usage, from, to := dispatchFlowFixture(t)
-	// 一条超长且带换行的上游原文：这里的重点就是「不加工」
-	long := strings.Repeat("上游原始报错 ", 200) + "\n<html>502 Bad Gateway</html>"
-	row := GatewayUsageLog{
-		GatewayGroupID: 31, RouteID: 11, ChannelID: 7, SourceGroupName: "源组A",
-		RequestID: "raw-1", Attempt: 1, Success: false, ErrorType: "http", StatusCode: 502,
-		RequestedModel: "gpt-5.6", ErrorMessage: long, ErrorDetail: "detail-原文",
-		UpstreamErrorBody: "<html>body</html>", UpstreamURL: "https://up/v1/messages",
-		CreatedAt: from.Add(9 * time.Minute),
-	}
-	if err := usage.Create(&row); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := usage.DispatchRawErrors(from, to, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("raw errors: %v", err)
-	}
-	// 窗口内失败尝试：fl-2 的 403、fl-3 的 403 与 502，加上刚写的这条
-	if got.Total != 4 {
-		t.Fatalf("total = %d, want 4", got.Total)
-	}
-	if got.Limit != dispatchRawErrorDefaultLimit {
-		t.Fatalf("limit = %d, want default %d", got.Limit, dispatchRawErrorDefaultLimit)
-	}
-	if len(got.Items) != 4 {
-		t.Fatalf("items = %d, want 4", len(got.Items))
-	}
-	// 新的在前
-	first := got.Items[0]
-	if first.RequestID != "raw-1" {
-		t.Fatalf("first item = %q, want raw-1 (最新的排最前)", first.RequestID)
-	}
-	if first.Message != long {
-		t.Fatalf("message 被改动了：len=%d want %d", len([]rune(first.Message)), len([]rune(long)))
-	}
-	if first.Detail != "detail-原文" || first.UpstreamBody != "<html>body</html>" || first.UpstreamURL != "https://up/v1/messages" {
-		t.Fatalf("raw fields = %+v", first)
-	}
-	if first.RouteLabel != "渠道七 · 源组A" || first.GatewayGroupName != "主网关" || first.Model != "gpt-5.6" {
-		t.Fatalf("identity = %+v", first)
-	}
-
-	// 按网关 + 路由过滤
-	scoped, err := usage.DispatchRawErrors(from, to, 31, 12, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if scoped.Total != 1 || len(scoped.Items) != 1 || scoped.Items[0].RouteID != 12 {
-		t.Fatalf("scoped = %d/%d", scoped.Total, len(scoped.Items))
-	}
-
-	// limit 只限条数，Total 仍然是窗口内的全量，否则「还有多少没看」就丢了
-	limited, err := usage.DispatchRawErrors(from, to, 0, 0, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if limited.Total != 4 || len(limited.Items) != 2 {
-		t.Fatalf("limited = total %d / items %d, want 4/2", limited.Total, len(limited.Items))
-	}
-	if capped, err := usage.DispatchRawErrors(from, to, 0, 0, 10_000); err != nil || capped.Limit != dispatchRawErrorMaxLimit {
-		t.Fatalf("limit 应被夹到 %d，实际 %d (err=%v)", dispatchRawErrorMaxLimit, capped.Limit, err)
 	}
 }
 

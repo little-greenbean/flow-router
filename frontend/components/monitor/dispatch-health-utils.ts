@@ -44,13 +44,33 @@ export function formatDuration(ms: number | null | undefined): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`
 }
 
-/** 原始报错行的时间戳：精确到秒，跨天时带上日期。 */
-export function formatErrorClock(iso: string, now = new Date()): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return iso
-  const sameDay = date.getFullYear() === now.getFullYear()
-    && date.getMonth() === now.getMonth()
-    && date.getDate() === now.getDate()
-  const clock = date.toLocaleTimeString("zh-CN", { hour12: false })
-  return sameDay ? clock : `${date.getMonth() + 1}/${date.getDate()} ${clock}`
+/**
+ * 使用记录深链接：切到「使用记录」标签，带上网关 + 结果筛选 + 时间区间。
+ *
+ * 时间用 datetime-local 的格式（YYYY-MM-DDTHH:mm，本地时区），因为那两个筛选框
+ * 就是 <input type="datetime-local">，传 ISO 带 Z 的话它认不出来会留空。
+ */
+export function dispatchUsagePath(
+  options: { group?: number; result: string; from: Date; to: Date },
+): string {
+  const params = new URLSearchParams({ tab: "usage", usage_result: options.result })
+  params.set("usage_group", options.group ? String(options.group) : "all")
+  params.set("usage_from", toDatetimeLocal(options.from))
+  params.set("usage_to", toDatetimeLocal(options.to))
+  return `/gateway?${params.toString()}`
+}
+
+export function toDatetimeLocal(date: Date): string {
+  if (Number.isNaN(date.getTime())) return ""
+  const pad = (value: number) => String(value).padStart(2, "0")
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/**
+ * 路由节点的配色索引。同一条路由在不同跳是不同节点，但必须是同一个颜色，
+ * 这样才能顺着颜色把一条路由在图上串起来——所以按 route_id 定色，不按位置。
+ */
+export function routeColorIndex(routeID: number, paletteSize: number): number {
+  if (!Number.isFinite(routeID) || paletteSize <= 0) return 0
+  return Math.abs(Math.trunc(routeID)) % paletteSize
 }

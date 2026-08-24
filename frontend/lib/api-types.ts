@@ -1013,37 +1013,14 @@ export interface GatewayDispatchFlow {
   max_hops: number
   nodes: GatewayDispatchFlowNode[]
   links: GatewayDispatchFlowLink[]
+  /** 窗口内有流量的网关清单，不受下钻过滤影响——下钻后还要靠它画切换 tag */
+  gateways: GatewayDispatchFlowGateway[]
 }
 
-/** 一条失败尝试的原文。刻意不归类、不合并、不截断。 */
-export interface GatewayDispatchRawError {
-  id: number
-  timestamp: string
-  request_id: string
-  attempt: number
-  attempt_kind?: string
+export interface GatewayDispatchFlowGateway {
   gateway_group_id: number
-  gateway_group_name?: string
-  route_id: number
-  route_label?: string
-  model?: string
-  status_code: number
-  error_type?: string
-  duration_ms: number
-  message?: string
-  detail?: string
-  upstream_url?: string
-  upstream_body?: string
-  upstream_headers?: string
-}
-
-export interface GatewayDispatchRawErrors {
-  from: string
-  to: string
-  /** 窗口内失败尝试的全量条数；items 只是其中最近的 limit 条 */
-  total: number
-  limit: number
-  items: GatewayDispatchRawError[]
+  name: string
+  requests: number
 }
 
 export interface GatewayDispatchErrorSample {

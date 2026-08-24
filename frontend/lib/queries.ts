@@ -14,7 +14,6 @@ import type {
   GatewayDispatchStats,
   GatewayDispatchErrors,
   GatewayDispatchFlow,
-  GatewayDispatchRawErrors,
   GatewayDispatchTrends,
   GatewayDispatchWindow,
   GatewayUsageStats,
@@ -182,18 +181,6 @@ export function useGatewayDispatchFlow(from?: string, to?: string, group?: numbe
   return useApi<GatewayDispatchFlow>(`/gateway/dispatch/flow${suffix ? `?${suffix}` : ""}`)
 }
 
-export function useGatewayDispatchRawErrors(
-  from?: string, to?: string, group?: number, route?: number, limit?: number,
-) {
-  const params = new URLSearchParams()
-  if (from) params.set("from", from)
-  if (to) params.set("to", to)
-  if (group) params.set("group", String(group))
-  if (route) params.set("route", String(route))
-  if (limit) params.set("limit", String(limit))
-  const suffix = params.toString()
-  return useApi<GatewayDispatchRawErrors>(`/gateway/dispatch/errors/raw${suffix ? `?${suffix}` : ""}`)
-}
 
 export function useAppVersion() {
   return useApi<AppVersion>("/version", false)

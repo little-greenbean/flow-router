@@ -1297,6 +1297,15 @@ type GatewayDispatchFlow struct {
 	MaxHops int                       `json:"max_hops"`
 	Nodes   []GatewayDispatchFlowNode `json:"nodes"`
 	Links   []GatewayDispatchFlowLink `json:"links"`
+	// Gateways 窗口内有流量的网关清单，**不受 groupID 过滤影响**。
+	// 下钻之后前端还要用它画切换用的 tag，所以不能让前端从 nodes 里凑。
+	Gateways []GatewayDispatchFlowGateway `json:"gateways"`
+}
+
+type GatewayDispatchFlowGateway struct {
+	GatewayGroupID uint   `json:"gateway_group_id"`
+	Name           string `json:"name"`
+	Requests       int    `json:"requests"`
 }
 
 // dispatchFlowAttempt 是一条链上的一次尝试，只留画图要用的字段。
@@ -1464,7 +1473,13 @@ func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint) (Gatew
 	result := GatewayDispatchFlow{
 		From: from, To: to, Scope: scope, GatewayGroupID: groupID,
 		Nodes: []GatewayDispatchFlowNode{}, Links: []GatewayDispatchFlowLink{},
+		Gateways: []GatewayDispatchFlowGateway{},
 	}
+	gateways, err := r.dispatchFlowGateways(from, to)
+	if err != nil {
+		return GatewayDispatchFlow{}, err
+	}
+	result.Gateways = gateways
 
 	var logs []GatewayUsageLog
 	query := r.db.Where("created_at >= ? AND created_at < ?", from, to)
@@ -1642,6 +1657,59 @@ func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint) (Gatew
 	return result, nil
 }
 
+// dispatchFlowGateways 统计窗口内每个网关的请求数（链级：一条 request_id 算一次）。
+// 单独走一条 GROUP BY 而不是复用上面那批日志，因为下钻时那批已经按网关过滤过了。
+func (r *GatewayUsageLogs) dispatchFlowGateways(from, to time.Time) ([]GatewayDispatchFlowGateway, error) {
+	type row struct {
+		GatewayGroupID uint
+		Requests       int
+	}
+	var rows []row
+	query := r.db.Model(&GatewayUsageLog{}).
+		Select("gateway_group_id, COUNT(DISTINCT request_id) AS requests").
+		Group("gateway_group_id")
+	if isSQLite(r.db) {
+		query = query.Where("CAST(strftime('%s', created_at) AS INTEGER) >= ? AND CAST(strftime('%s', created_at) AS INTEGER) < ?", from.Unix(), to.Unix())
+	} else {
+		query = query.Where("created_at >= ? AND created_at < ?", from, to)
+	}
+	if err := query.Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return []GatewayDispatchFlowGateway{}, nil
+	}
+	ids := make(map[uint]struct{}, len(rows))
+	for _, item := range rows {
+		ids[item.GatewayGroupID] = struct{}{}
+	}
+	names := make(map[uint]string)
+	var dbGroups []GatewayGroup
+	if err := r.db.Where("id IN ?", keysOfUintSet(ids)).Find(&dbGroups).Error; err == nil {
+		for _, group := range dbGroups {
+			names[group.ID] = group.Name
+		}
+	}
+	result := make([]GatewayDispatchFlowGateway, 0, len(rows))
+	for _, item := range rows {
+		name := names[item.GatewayGroupID]
+		if name == "" {
+			name = fmt.Sprintf("组 #%d", item.GatewayGroupID)
+		}
+		result = append(result, GatewayDispatchFlowGateway{
+			GatewayGroupID: item.GatewayGroupID, Name: name, Requests: item.Requests,
+		})
+	}
+	// 流量大的排前面，tag 顺序才稳定
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Requests != result[j].Requests {
+			return result[i].Requests > result[j].Requests
+		}
+		return result[i].GatewayGroupID < result[j].GatewayGroupID
+	})
+	return result, nil
+}
+
 func keysOfUintSet(set map[uint]struct{}) []uint {
 	keys := make([]uint, 0, len(set))
 	for key := range set {
@@ -1649,147 +1717,6 @@ func keysOfUintSet(set map[uint]struct{}) []uint {
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	return keys
-}
-
-// ---- 原始报错 ----
-//
-// 刻意不做任何加工：不归类、不合并、不截断 error_message。
-// 汇总视图（DispatchErrors）回答「错得多不多」，这里回答「到底报的什么」——
-// 排查时要的就是上游原话，任何提炼都可能把关键信息炼没了。
-
-type GatewayDispatchRawError struct {
-	ID          uint      `json:"id"`
-	Timestamp   time.Time `json:"timestamp"`
-	RequestID   string    `json:"request_id"`
-	Attempt     int       `json:"attempt"`
-	AttemptKind string    `json:"attempt_kind,omitempty"`
-
-	GatewayGroupID   uint   `json:"gateway_group_id"`
-	GatewayGroupName string `json:"gateway_group_name,omitempty"`
-	RouteID          uint   `json:"route_id"`
-	RouteLabel       string `json:"route_label,omitempty"`
-
-	Model      string `json:"model,omitempty"`
-	StatusCode int    `json:"status_code"`
-	ErrorType  string `json:"error_type,omitempty"`
-	DurationMS int64  `json:"duration_ms"`
-
-	Message         string `json:"message,omitempty"`
-	Detail          string `json:"detail,omitempty"`
-	UpstreamURL     string `json:"upstream_url,omitempty"`
-	UpstreamBody    string `json:"upstream_body,omitempty"`
-	UpstreamHeaders string `json:"upstream_headers,omitempty"`
-}
-
-type GatewayDispatchRawErrors struct {
-	From  time.Time                 `json:"from"`
-	To    time.Time                 `json:"to"`
-	Total int64                     `json:"total"`
-	Limit int                       `json:"limit"`
-	Items []GatewayDispatchRawError `json:"items"`
-}
-
-const (
-	dispatchRawErrorDefaultLimit = 50
-	dispatchRawErrorMaxLimit     = 200
-)
-
-// DispatchRawErrors 返回窗口内最近的失败尝试原文，新的在前。
-// groupID / routeID 为 0 表示不过滤。注意 upstream_body 可能到几十 KB，
-// 所以默认只取 50 条——限制的是条数，不是每条的内容。
-func (r *GatewayUsageLogs) DispatchRawErrors(from, to time.Time, groupID, routeID uint, limit int) (GatewayDispatchRawErrors, error) {
-	if from.IsZero() || to.IsZero() || !to.After(from) {
-		return GatewayDispatchRawErrors{}, fmt.Errorf("invalid dispatch raw error range")
-	}
-	if limit <= 0 {
-		limit = dispatchRawErrorDefaultLimit
-	}
-	if limit > dispatchRawErrorMaxLimit {
-		limit = dispatchRawErrorMaxLimit
-	}
-	result := GatewayDispatchRawErrors{From: from, To: to, Limit: limit, Items: []GatewayDispatchRawError{}}
-
-	scope := func() *gorm.DB {
-		query := r.db.Model(&GatewayUsageLog{}).Where("success = ?", false)
-		if isSQLite(r.db) {
-			query = query.Where("CAST(strftime('%s', created_at) AS INTEGER) >= ? AND CAST(strftime('%s', created_at) AS INTEGER) < ?", from.Unix(), to.Unix())
-		} else {
-			query = query.Where("created_at >= ? AND created_at < ?", from, to)
-		}
-		if groupID > 0 {
-			query = query.Where("gateway_group_id = ?", groupID)
-		}
-		if routeID > 0 {
-			query = query.Where("route_id = ?", routeID)
-		}
-		return query
-	}
-
-	if err := scope().Count(&result.Total).Error; err != nil {
-		return GatewayDispatchRawErrors{}, err
-	}
-	var logs []GatewayUsageLog
-	if err := scope().Order("created_at DESC, id DESC").Limit(limit).Find(&logs).Error; err != nil {
-		return GatewayDispatchRawErrors{}, err
-	}
-	if len(logs) == 0 {
-		return result, nil
-	}
-
-	groupIDs := make(map[uint]struct{})
-	channelIDs := make(map[uint]struct{})
-	identities := make(map[uint]*dispatchRouteIdentity)
-	for _, log := range logs {
-		groupIDs[log.GatewayGroupID] = struct{}{}
-		if log.ChannelID > 0 {
-			channelIDs[log.ChannelID] = struct{}{}
-		}
-		identity := identities[log.RouteID]
-		if identity == nil {
-			identity = &dispatchRouteIdentity{}
-			identities[log.RouteID] = identity
-		}
-		identity.absorb(log)
-	}
-	groupNames := make(map[uint]string)
-	if len(groupIDs) > 0 {
-		var dbGroups []GatewayGroup
-		if err := r.db.Where("id IN ?", keysOfUintSet(groupIDs)).Find(&dbGroups).Error; err == nil {
-			for _, group := range dbGroups {
-				groupNames[group.ID] = group.Name
-			}
-		}
-	}
-	channelNames := make(map[uint]string)
-	if len(channelIDs) > 0 {
-		var dbChannels []Channel
-		if err := r.db.Where("id IN ?", keysOfUintSet(channelIDs)).Find(&dbChannels).Error; err == nil {
-			for _, channel := range dbChannels {
-				channelNames[channel.ID] = channel.Name
-			}
-		}
-	}
-
-	for _, log := range logs {
-		item := GatewayDispatchRawError{
-			ID: log.ID, Timestamp: log.CreatedAt, RequestID: log.RequestID,
-			Attempt: log.Attempt, AttemptKind: log.AttemptKind,
-			GatewayGroupID: log.GatewayGroupID, GatewayGroupName: groupNames[log.GatewayGroupID],
-			RouteID: log.RouteID, Model: log.RequestedModel,
-			StatusCode: log.StatusCode, ErrorType: log.ErrorType, DurationMS: log.DurationMS,
-			Message: log.ErrorMessage, Detail: log.ErrorDetail,
-			UpstreamURL: log.UpstreamURL, UpstreamBody: log.UpstreamErrorBody,
-			UpstreamHeaders: log.UpstreamErrorHeaders,
-		}
-		if item.GatewayGroupName == "" {
-			item.GatewayGroupName = fmt.Sprintf("组 #%d", log.GatewayGroupID)
-		}
-		if identity := identities[log.RouteID]; identity != nil {
-			item.RouteLabel = identity.label(log.RouteID, channelNames)
-		}
-		result.Items = append(result.Items, item)
-	}
-	return result, nil
 }
 
 func averageFloat(values []float64) float64 {

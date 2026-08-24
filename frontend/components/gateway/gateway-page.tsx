@@ -217,6 +217,20 @@ export function GatewayPage() {
     const value = Number(searchParams.get("route"))
     return Number.isInteger(value) && value > 0 ? value : null
   }, [searchParams])
+  /**
+   * 调度面板点结局节点跳过来的使用记录深链接：
+   * ?tab=usage&usage_group=<id|all>&usage_result=<mode>&usage_from=&usage_to=
+   * 时间是 datetime-local 的本地格式，直接塞给那两个输入框。
+   */
+  const usageDeepLink = useMemo(() => {
+    if (searchParams.get("tab") !== "usage") return null
+    return {
+      group: searchParams.get("usage_group") ?? "all",
+      result: searchParams.get("usage_result") ?? "all",
+      from: searchParams.get("usage_from") ?? "",
+      to: searchParams.get("usage_to") ?? "",
+    }
+  }, [searchParams])
 
   const channelNameByID = useMemo(() => {
     const m = new Map<number, string>()
@@ -520,9 +534,11 @@ export function GatewayPage() {
     void loadGroups()
     void loadPrices()
     void loadProviderOptions()
-    // 使用记录默认加载全部网关组，与左侧选中组无关
-    void loadUsage({ groupID: "all", page: 1, pageSize: 50 })
-  }, [loadGroups, loadPrices, loadProviderOptions, loadUsage])
+    // 使用记录默认加载全部网关组，与左侧选中组无关。
+    // 但带着深链接进来时要跳过：这个 effect 的依赖是几个 useCallback，identity 一变就重跑，
+    // 每重跑一次就会用「全部/不筛选」把深链接刚拉到的结果盖掉（实测能盖 5 次以上）。
+    if (!usageDeepLink) void loadUsage({ groupID: "all", page: 1, pageSize: 50 })
+  }, [loadGroups, loadPrices, loadProviderOptions, loadUsage, usageDeepLink])
 
   // 模型下拉随组 / 密钥 / 时间范围变化重新聚合（不含模型自身筛选）
   useEffect(() => {
@@ -711,6 +727,39 @@ export function GatewayPage() {
   useEffect(() => {
     void refreshUsageKeys(usageGroupFilter, groups)
   }, [usageGroupFilter, groups, refreshUsageKeys])
+
+  // 调度面板结局节点深链接：切到使用记录标签，把筛选一次性落好再让它自己去拉数据。
+  const usageDeepLinkKeyRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!usageDeepLink) return
+    const key = JSON.stringify(usageDeepLink)
+    // 只在链接本身变化时应用一次，之后用户手动改筛选不该被拽回去
+    if (usageDeepLinkKeyRef.current === key) return
+    usageDeepLinkKeyRef.current = key
+    setMainTab("usage")
+    setUsageGroupFilter(usageDeepLink.group)
+    setUsageSuccessFilter(usageDeepLink.result)
+    setUsageFrom(usageDeepLink.from)
+    setUsageTo(usageDeepLink.to)
+    // 其余筛选清回默认，否则深链接会跟上一次遗留的密钥/模型筛选叠在一起
+    setUsageKeyFilter("all")
+    setUsageModelFilter("all")
+    setUsageRequestIDFilter("")
+    setUsagePage(1)
+    // 使用记录是手动查询的（有「查询」按钮），setState 之后不会自己去拉；
+    // 而且这里也不能用 usageQueryOpts——它读的还是这一轮渲染的旧 state。
+    void loadUsage({
+      groupID: usageDeepLink.group,
+      keyID: "all",
+      model: "all",
+      requestID: "",
+      success: usageDeepLink.result,
+      from: usageDeepLink.from,
+      to: usageDeepLink.to,
+      page: 1,
+      pageSize: usagePageSize,
+    })
+  }, [usageDeepLink, loadUsage, usagePageSize])
 
   // 调度面板深链接：先切组，再切到渠道路由标签。
   useEffect(() => {

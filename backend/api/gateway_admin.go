@@ -66,7 +66,6 @@ func registerGatewayAdmin(g *gin.RouterGroup, d *Deps) {
 		gp.GET("/dispatch/trends", func(c *gin.Context) { trendsGatewayDispatch(c, d) })
 		gp.GET("/dispatch/errors", func(c *gin.Context) { errorsGatewayDispatch(c, d) })
 		gp.GET("/dispatch/flow", func(c *gin.Context) { flowGatewayDispatch(c, d) })
-		gp.GET("/dispatch/errors/raw", func(c *gin.Context) { rawErrorsGatewayDispatch(c, d) })
 		gp.GET("/usage", func(c *gin.Context) { listGatewayUsage(c, d) })
 		gp.GET("/usage/stats", func(c *gin.Context) { statsGatewayUsage(c, d) })
 		gp.GET("/usage/models", func(c *gin.Context) { listGatewayUsageModels(c, d) })
@@ -247,28 +246,6 @@ func flowGatewayDispatch(c *gin.Context, d *Deps) {
 		return
 	}
 	c.JSON(http.StatusOK, flow)
-}
-
-func rawErrorsGatewayDispatch(c *gin.Context, d *Deps) {
-	if d.GatewayUsage == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "usage storage unavailable"})
-		return
-	}
-	from, to, ok := dispatchRange(c)
-	if !ok {
-		return
-	}
-	raw, err := d.GatewayUsage.DispatchRawErrors(
-		from, to,
-		uint(queryInt(c, "group", 0)),
-		uint(queryInt(c, "route", 0)),
-		queryInt(c, "limit", 0),
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, raw)
 }
 
 func listGatewayProviders(c *gin.Context, d *Deps) {
