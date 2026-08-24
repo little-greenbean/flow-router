@@ -2087,6 +2087,17 @@ type GatewayUsageQuery struct {
 	//   multi — 含重试/顺延（同 request_id 多条 或 attempt>1）
 	//   multi_success — 最终成功且链路含重试/顺延（如 2/2·顺延）
 	//   multi_fail — 含重试/顺延且最终失败
+	//
+	// 下面三个是**链级**口径，跟调度桑基图右侧那三个结局一一对应，每条链只返回
+	// 最后一次尝试那一行（行数 = 链数，跟图上的数字对得上；要看完整链路点行内的
+	// 「查看全部 N 次尝试」）：
+	//   chain_direct — 一次过：整条链只尝试了一次且成功
+	//   chain_recovered — 顺延后成功：尝试过多次，最后一次成功
+	//   chain_failed — 最终失败：最后一次尝试失败
+	//
+	// 别拿 success/fail 去套图上的结局：那两个是**尝试级**的。一条顺延三次才成功的
+	// 请求，会往 fail 里贡献 3 行中间失败——从图上点「最终失败」跳过来却看到一堆
+	// 其实最后成功了的请求，正是这个原因。
 	ResultMode string
 	From       *time.Time
 	To         *time.Time
@@ -2212,6 +2223,28 @@ func (r *GatewayUsageLogs) applyFilters(db *gorm.DB, q GatewayUsageQuery) *gorm.
 					AND SUM(CASE WHEN success = 1 OR success = true THEN 1 ELSE 0 END) > 0
 			)`,
 		)
+	case "chain_direct", "chain_recovered", "chain_failed":
+		// 链级结局：先按 request_id 归组拿到「最后一次尝试」（id 单调递增，最大的那条
+		// 就是链尾，跟 DispatchFlow 里按 created_at ASC, id ASC 取最后一条同一个口径），
+		// 再按链尾的成败和链长筛。只命中链尾那一行，所以行数就是链数。
+		cond := "(f.success = 1 OR f.success = true)"
+		switch mode {
+		case "chain_direct":
+			cond = "c.attempts = 1 AND " + cond
+		case "chain_recovered":
+			cond = "c.attempts > 1 AND " + cond
+		case "chain_failed":
+			cond = "(f.success = 0 OR f.success = false)"
+		}
+		db = db.Where(`id IN (
+			SELECT c.last_id FROM (
+				SELECT request_id, MAX(id) AS last_id, COUNT(*) AS attempts
+				FROM gateway_usage_logs
+				WHERE request_id != '' AND request_id IS NOT NULL
+				GROUP BY request_id
+			) c JOIN gateway_usage_logs f ON f.id = c.last_id
+			WHERE ` + cond + `
+		)`)
 	case "multi_fail", "chain_fail":
 		db = db.Where(
 			`request_id != '' AND request_id IN (

@@ -504,6 +504,11 @@ export function UsagePanel({
                 顺延后成功（如 2/2 · 顺延）
               </SelectItem>
               <SelectItem value="multi_fail">重试/顺延后仍失败</SelectItem>
+              {/* 链级口径：每条请求链只出最后一次尝试那一行，条数跟首页调度图上的
+                  三个结局一一对应（上面的「仅成功 / 仅失败」是尝试级，对不上） */}
+              <SelectItem value="chain_direct">整条链：一次过</SelectItem>
+              <SelectItem value="chain_recovered">整条链：顺延后成功</SelectItem>
+              <SelectItem value="chain_failed">整条链：最终失败</SelectItem>
             </SelectContent>
           </Select>
         </div>

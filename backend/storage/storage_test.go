@@ -1696,3 +1696,72 @@ func TestDispatchSeverityClassifiesByUrgency(t *testing.T) {
 		}
 	}
 }
+
+// 从调度图右侧点某个结局跳到使用记录时，两边的数字必须对得上。
+// 别用 success/fail：那是尝试级的，一条顺延后才成功的链会往 fail 里塞中间失败行。
+func TestGatewayUsageChainResultModesMatchDispatchOutcomes(t *testing.T) {
+	usage, from, to := dispatchFlowFixture(t)
+
+	// 先拿图上的三个结局作为基准（只看主网关 31）
+	flow, err := usage.DispatchFlow(from, to, 31)
+	if err != nil {
+		t.Fatalf("dispatch flow: %v", err)
+	}
+	want := map[string]int{}
+	for _, node := range flow.Nodes {
+		if node.Kind == dispatchFlowNodeOutcome {
+			want[node.Outcome] = node.Value
+		}
+	}
+	// fixture：fl-1 一次过 / fl-2 顺延后成功 / fl-3 最终失败
+	if want[dispatchOutcomeDirect] != 1 || want[dispatchOutcomeRecovered] != 1 || want[dispatchOutcomeFailed] != 1 {
+		t.Fatalf("图上的结局基准不符合预期: %+v", want)
+	}
+
+	list := func(mode string) *GatewayUsagePage {
+		t.Helper()
+		page, err := usage.List(GatewayUsageQuery{
+			GatewayGroupID: 31, ResultMode: mode, From: &from, To: &to, Page: 1, PageSize: 50,
+		})
+		if err != nil {
+			t.Fatalf("list %s: %v", mode, err)
+		}
+		return page
+	}
+
+	for mode, outcome := range map[string]string{
+		"chain_direct":    dispatchOutcomeDirect,
+		"chain_recovered": dispatchOutcomeRecovered,
+		"chain_failed":    dispatchOutcomeFailed,
+	} {
+		page := list(mode)
+		if int(page.Total) != want[outcome] {
+			t.Fatalf("%s 返回 %d 行，图上「%s」是 %d 条链——两边必须一致",
+				mode, page.Total, dispatchOutcomeLabels[outcome], want[outcome])
+		}
+		// 每条链只出链尾那一行，所以行数就是链数；且链尾的成败要跟结局一致
+		for _, item := range page.Items {
+			if outcome == dispatchOutcomeFailed && item.Success {
+				t.Fatalf("chain_failed 出现了成功的链尾: request_id=%s", item.RequestID)
+			}
+			if outcome != dispatchOutcomeFailed && !item.Success {
+				t.Fatalf("%s 出现了失败的链尾: request_id=%s", mode, item.RequestID)
+			}
+		}
+	}
+
+	// 对照组：尝试级的 fail 会把「顺延后成功」那条链的中间失败也算进来，
+	// 所以它一定比链级的最终失败多——这正是从图上点过去数字对不上的原因。
+	attemptLevelFail := list("fail")
+	if int(attemptLevelFail.Total) <= want[dispatchOutcomeFailed] {
+		t.Fatalf("尝试级 fail = %d，应当多于链级最终失败 %d（fl-2 的第 1 跳失败也会被算进去）",
+			attemptLevelFail.Total, want[dispatchOutcomeFailed])
+	}
+
+	// chain_direct 只认「只尝试过一次」的链：fl-2 最后虽然成功，但它顺延过，不能进来
+	for _, item := range list("chain_direct").Items {
+		if item.RequestID != "fl-1" {
+			t.Fatalf("chain_direct 混进了 %s，一次过只能是单次尝试就成功的链", item.RequestID)
+		}
+	}
+}

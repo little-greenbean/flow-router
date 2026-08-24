@@ -156,7 +156,7 @@ export function GatewayPage() {
     GatewayUsageModelOption[]
   >([])
   const [usageRequestIDFilter, setUsageRequestIDFilter] = useState("")
-  /** all | success | client | fail | multi | multi_success | multi_fail */
+  /** all | success | client | fail | multi | multi_success | multi_fail | chain_direct | chain_recovered | chain_failed */
   const [usageSuccessFilter, setUsageSuccessFilter] = useState<string>("all")
   const [usageFrom, setUsageFrom] = useState("")
   const [usageTo, setUsageTo] = useState("")
@@ -449,7 +449,7 @@ export function GatewayPage() {
       keyID?: string
       model?: string
       requestID?: string
-      /** all | success | client | fail | multi | multi_success | multi_fail；兼容 true/false */
+      /** all | success | client | fail | multi | multi_success | multi_fail | chain_*；兼容 true/false */
       success?: string
       from?: string
       to?: string

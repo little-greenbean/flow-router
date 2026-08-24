@@ -60,13 +60,16 @@ const FLOW_COLORS = {
   failed: "#e03131",
 } as const
 
-// 结局 → 使用记录的结果筛选。注意「最终失败」在图上是链级（最后一次尝试失败），
-// 而使用记录的 fail 是尝试级且不含客户端断开，两者不是严格等价——但 fail 是
-// 唯一能把所有真失败行都捞出来的筛选，跳过去正是要看这些行。
+// 结局 → 使用记录的结果筛选。用的是**链级**口径（chain_*），跟图上这三个结局
+// 逐条对齐：每条链只返回最后一次尝试那一行，所以跳过去列表的条数就是图上的数字。
+//
+// 别退回 success / fail：那是尝试级的。一条顺延三次才成功的请求会往 fail 里贡献
+// 3 行中间失败，点「最终失败」跳过去会看到一堆其实最后成功了的请求——实测某个网关
+// 图上 32 条最终失败，按 fail 跳过去是 146 行，差 4.5 倍。
 const OUTCOME_USAGE_FILTER: Record<string, string> = {
-  direct: "success",
-  recovered: "multi_success",
-  failed: "fail",
+  direct: "chain_direct",
+  recovered: "chain_recovered",
+  failed: "chain_failed",
 }
 
 const OUTCOME_HINT: Record<string, string> = {

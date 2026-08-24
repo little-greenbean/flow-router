@@ -698,6 +698,7 @@ func parseGatewayUsageQuery(c *gin.Context) storage.GatewayUsageQuery {
 		}
 	}
 	// result 优先：success | fail | client | multi | multi_success | multi_fail
+	//   以及链级口径 chain_direct | chain_recovered | chain_failed（跟调度图的三个结局对应）
 	if v := strings.TrimSpace(c.Query("result")); v != "" {
 		q.ResultMode = strings.ToLower(v)
 	} else if v := c.Query("success"); v == "true" || v == "1" {
