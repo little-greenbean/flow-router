@@ -1015,6 +1015,17 @@ export interface GatewayDispatchFlow {
   links: GatewayDispatchFlowLink[]
   /** 窗口内有流量的网关清单，不受下钻过滤影响——下钻后还要靠它画切换 tag */
   gateways: GatewayDispatchFlowGateway[]
+  /** 按「顺延次数」分组的完整路径（节点 id / "source|target" 连线 key），只在
+   *  scope=gateway 时非空；用来给「顺延次数」按钮做原地高亮，不用为高亮重新拉数据 */
+  highlights: GatewayDispatchFlowHighlight[]
+}
+
+export interface GatewayDispatchFlowHighlight {
+  /** 这条链一共顺延了几次：总尝试数－1，含同路由重试 */
+  failovers: number
+  node_ids: string[]
+  /** 格式 "source|target"，跟 link.source + "|" + link.target 对应 */
+  link_keys: string[]
 }
 
 export interface GatewayDispatchFlowGateway {

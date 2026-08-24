@@ -1516,6 +1516,71 @@ func TestGatewayUsageDispatchFlowDrillsIntoRoutesByHop(t *testing.T) {
 	}
 }
 
+func TestGatewayUsageDispatchFlowGroupsHighlightsByWholeChain(t *testing.T) {
+	usage, from, to := dispatchFlowFixture(t)
+	flow, err := usage.DispatchFlow(from, to, 31)
+	if err != nil {
+		t.Fatalf("dispatch flow: %v", err)
+	}
+	byFailovers := make(map[int]GatewayDispatchFlowHighlight)
+	for _, group := range flow.Highlights {
+		byFailovers[group.Failovers] = group
+	}
+	if len(byFailovers) != 2 {
+		t.Fatalf("highlight groups = %d, want 2 (0 次 / 1 次)", len(byFailovers))
+	}
+
+	// fl-1 零顺延，一次过：只覆盖它自己那条短路径，不该带上 fl-2/fl-3 顺延到的路由 12
+	zero, ok := byFailovers[0]
+	if !ok {
+		t.Fatal("missing 0-failover group")
+	}
+	wantZeroNodes := []string{"g:31", "h1:r11", "o:direct"}
+	if !equalStringSlices(zero.NodeIDs, wantZeroNodes) {
+		t.Fatalf("0 次 node ids = %v, want %v", zero.NodeIDs, wantZeroNodes)
+	}
+	wantZeroLinks := []string{"g:31|h1:r11", "h1:r11|o:direct"}
+	if !equalStringSlices(zero.LinkKeys, wantZeroLinks) {
+		t.Fatalf("0 次 link keys = %v, want %v", zero.LinkKeys, wantZeroLinks)
+	}
+
+	// fl-2（成功）和 fl-3（失败）都顺延了 1 次，路径除了结局都一样——
+	// 高亮要覆盖两条链完整走过的节点/连线（从入口一路到各自的结局），不是只挑一跳
+	one, ok := byFailovers[1]
+	if !ok {
+		t.Fatal("missing 1-failover group")
+	}
+	wantOneNodes := []string{"g:31", "h1:r11", "h2:r12", "o:failed", "o:recovered"}
+	if !equalStringSlices(one.NodeIDs, wantOneNodes) {
+		t.Fatalf("1 次 node ids = %v, want %v", one.NodeIDs, wantOneNodes)
+	}
+	wantOneLinks := []string{"g:31|h1:r11", "h1:r11|h2:r12", "h2:r12|o:failed", "h2:r12|o:recovered"}
+	if !equalStringSlices(one.LinkKeys, wantOneLinks) {
+		t.Fatalf("1 次 link keys = %v, want %v", one.LinkKeys, wantOneLinks)
+	}
+
+	// 全部网关视图没有「跳」这个概念，高亮分组应该恒为空，别让前端误以为能高亮
+	overview, err := usage.DispatchFlow(from, to, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.Highlights) != 0 {
+		t.Fatalf("overview highlights = %+v, want empty", overview.Highlights)
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestGatewayUsageDispatchFlowCollapsesDeepChains(t *testing.T) {
 	db := openTestDB(t)
 	usage := NewGatewayUsageLogs(db)
@@ -1556,6 +1621,17 @@ func TestGatewayUsageDispatchFlowCollapsesDeepChains(t *testing.T) {
 		if node.Hop > dispatchFlowMaxHops {
 			t.Fatalf("node %s 的 hop=%d 超过上限，应该收进 h:more", node.ID, node.Hop)
 		}
+	}
+	// 顺延次数按真实总尝试数算（8 次尝试 = 顺延 7 次），不因为画图时把它压缩进
+	// 「更深跳以后」这一个节点就跟着截断——高亮分组用的是这条链完整走过的节点，
+	// 超限部分自然就是那一个溢出节点
+	if len(flow.Highlights) != 1 || flow.Highlights[0].Failovers != hops-1 {
+		t.Fatalf("highlights = %+v, want one group with failovers=%d", flow.Highlights, hops-1)
+	}
+	if !equalStringSlices(flow.Highlights[0].NodeIDs, []string{
+		"g:41", "h1:r100", "h2:r101", "h3:r102", "h4:r103", "h5:r104", "h:more", "o:recovered",
+	}) {
+		t.Fatalf("highlight node ids = %v", flow.Highlights[0].NodeIDs)
 	}
 }
 

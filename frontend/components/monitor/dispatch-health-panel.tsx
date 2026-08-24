@@ -9,6 +9,7 @@ import { useGatewayDispatchFlow } from "@/lib/queries"
 import { useRefreshTick } from "@/lib/refresh-context"
 import type {
   GatewayDispatchFlow,
+  GatewayDispatchFlowHighlight,
   GatewayDispatchFlowNode,
   GatewayDispatchWindow,
 } from "@/lib/api-types"
@@ -94,9 +95,21 @@ function flowHeight(flow: GatewayDispatchFlow | null | undefined): number {
   return Math.min(900, Math.max(300, widest * 44 + 90))
 }
 
-function flowOption(flow: GatewayDispatchFlow, chartHeight: number) {
+function flowOption(
+  flow: GatewayDispatchFlow,
+  chartHeight: number,
+  highlight: GatewayDispatchFlowHighlight | null,
+  animate: boolean,
+) {
   const nodeByID = new Map(flow.nodes.map((node) => [node.id, node]))
   const total = flow.requests
+  // 高亮的是「这个顺延次数的链，从入口到结局的完整路径」，成员在后端已经按整条链
+  // 并好了；这里只管按成员身份分两档不透明度，别的不管——不用 ECharts 自带的
+  // emphasis.focus:'adjacency' 去猜，因为它是按"这个节点挨着哪些边"算的，多条链
+  // 共享同一个入口节点时会把不属于这次高亮的边也一起点亮，等于又把片段以外的
+  // 东西带出来了
+  const highlightNodes = highlight ? new Set(highlight.node_ids) : null
+  const highlightLinks = highlight ? new Set(highlight.link_keys) : null
   // 最后一列的标签默认画在节点右边，会被画布裁掉，翻到左边去
   const maxDepth = flow.nodes.reduce((max, node) => Math.max(max, node.depth), 0)
 
@@ -129,10 +142,21 @@ function flowOption(flow: GatewayDispatchFlow, chartHeight: number) {
   const estimatedNodeHeight = (node: GatewayDispatchFlowNode): number => node.value * minKy
 
   return {
-    animationDuration: 240,
+    // 只在数据真的变了（换网关/换时间窗口/首次加载）才播入场动画；
+    // 单纯切换高亮不该有整张图重新长出来的动画，那看着就是「重新生成了一张图」
+    animationDuration: animate ? 240 : 0,
+    animationDurationUpdate: animate ? 240 : 0,
     tooltip: {
       trigger: "item" as const,
       confine: true,
+      // ECharts 默认把 tooltip 挂到 document.body 上（appendToBody 默认 true），
+      // 定位算的是页面坐标——真出过偏差的话，一个跟卡片毫不相关的小色块就会飘在
+      // 页面别的地方，confine:true 按理说会把它按住，但既然挂在 body 上就已经跳出了
+      // 咱们卡片自己的 DOM 子树，Card 上的 overflow-hidden 对它完全不起作用。
+      // 改成挂在图表自己的容器里（下面 chartRef 那层给了 position:relative +
+      // overflow:hidden），tooltip 就只能在这层容器内部定位、被这层裁切，
+      // 无论算出什么坐标都跳不出这张卡片。
+      appendToBody: false,
       borderColor: "#dde3ea",
       textStyle: { fontSize: 11 },
       formatter: (params: unknown) => {
@@ -176,33 +200,41 @@ function flowOption(flow: GatewayDispatchFlow, chartHeight: number) {
         // 不要把节点字段摊到 data 上：我们的 label 是字符串，ECharts 的 label 是配置对象，
         // 摊平会互相覆盖（点一下就把 label 对象当成名字塞进 React，直接白屏）。
         // 原始节点整个挂在 raw 上，tooltip 和 click 都从 raw 取。
-        data: flow.nodes.map((node) => ({
-          raw: node,
-          name: node.id,
-          value: node.value,
-          depth: node.depth,
-          itemStyle: { color: nodeColor(node), borderWidth: 0, borderRadius: 2 },
-          label: {
-            fontSize: 10,
-            color: "#3b444f",
-            position: node.depth === maxDepth ? ("left" as const) : ("right" as const),
-            // 标签会压在色带上，加一圈白描边才读得清
-            textBorderColor: "rgba(255,255,255,.92)",
-            textBorderWidth: 3,
-            // 用 id 当 name 保证唯一（同一条路由在不同跳是不同节点），
-            // 所以标签必须自己给，不能让 ECharts 直接画 name；
-            // 节点太薄时干脆不给文字，省得跟邻居叠在一起（hover 还能看 tooltip）
-            formatter: () => estimatedNodeHeight(node) >= MIN_LABEL_HEIGHT ? node.label : "",
-          },
-        })),
+        data: flow.nodes.map((node) => {
+          const dimmed = highlightNodes != null && !highlightNodes.has(node.id)
+          return {
+            raw: node,
+            name: node.id,
+            value: node.value,
+            depth: node.depth,
+            itemStyle: { color: nodeColor(node), borderWidth: 0, borderRadius: 2, opacity: dimmed ? 0.15 : 1 },
+            label: {
+              fontSize: 10,
+              color: "#3b444f",
+              opacity: dimmed ? 0.35 : 1,
+              position: node.depth === maxDepth ? ("left" as const) : ("right" as const),
+              // 标签会压在色带上，加一圈白描边才读得清
+              textBorderColor: "rgba(255,255,255,.92)",
+              textBorderWidth: 3,
+              // 用 id 当 name 保证唯一（同一条路由在不同跳是不同节点），
+              // 所以标签必须自己给，不能让 ECharts 直接画 name；
+              // 节点太薄时干脆不给文字，省得跟邻居叠在一起（hover 还能看 tooltip）
+              formatter: () => estimatedNodeHeight(node) >= MIN_LABEL_HEIGHT ? node.label : "",
+            },
+          }
+        }),
         links: flow.links.map((link) => {
           // 成功的流量跟着来源上色（顺着颜色能看出这股流量是谁发出去的），
           // 失败转走的一律标红——「哪条路在往外甩」是这张图最该一眼看到的事
           const source = nodeByID.get(link.source)
           const color = link.failed ? FLOW_COLORS.failed : source ? nodeColor(source) : FLOW_COLORS.entry
+          const baseOpacity = link.failed ? 0.42 : 0.24
+          const inHighlight = highlightLinks?.has(`${link.source}|${link.target}`)
+          // 命中的连线适当调亮一点，在被调暗的背景里才立得住；没命中的直接压得很淡
+          const opacity = highlightLinks == null ? baseOpacity : inHighlight ? Math.min(1, baseOpacity + 0.35) : 0.03
           return {
             ...link,
-            lineStyle: { color, opacity: link.failed ? 0.42 : 0.24, curveness: 0.5 },
+            lineStyle: { color, opacity, curveness: 0.5 },
           }
         }),
       },
@@ -213,8 +245,8 @@ function flowOption(flow: GatewayDispatchFlow, chartHeight: number) {
 export function DispatchHealthPanel() {
   const [rangeValue, setRangeValue] = useState<GatewayDispatchWindow>("1h")
   const [drillGateway, setDrillGateway] = useState<number | null>(null)
-  // null = 不高亮任何一跳；否则是被选中的跳数（从当前数据里实际出现过的跳数中选）
-  const [highlightHop, setHighlightHop] = useState<number | null>(null)
+  // null = 不高亮；否则是选中的顺延次数——对应后端按整条链路径分好组的 highlights
+  const [highlightFailovers, setHighlightFailovers] = useState<number | null>(null)
   const tick = useRefreshTick()
   const navigate = useNavigate()
 
@@ -238,23 +270,17 @@ export function DispatchHealthPanel() {
     }
   }, [flowData, drillGateway])
 
-  // 下钻到该网关内部才有「跳」这个概念——路由节点才带 hop，网关/结局节点没有
-  const availableHops = useMemo(() => {
-    if (!flowData) return []
-    const hops = new Set<number>()
-    for (const node of flowData.nodes) {
-      if (node.kind === "route" && node.hop) hops.add(node.hop)
-    }
-    return [...hops].sort((a, b) => a - b)
-  }, [flowData])
+  // 顺延次数按钮：直接用后端算好的分组（每组已经是「顺延了这么多次的链，从入口到
+  // 结局完整路径」），前端不用再猜——下钻到具体网关时才有（全部网关视图里恒为空）
+  const highlightGroups = flowData?.highlights ?? []
 
-  // 换了网关/时间窗口后，之前选的那一跳可能已经不存在了（比如原来选第 4 跳，
-  // 新数据最深只到第 2 跳），清掉免得按钮选中态和实际高亮对不上
+  // 换了网关/时间窗口后，之前选的那个次数可能已经不存在了，清掉免得按钮选中态
+  // 和实际高亮对不上
   useEffect(() => {
-    if (highlightHop != null && !availableHops.includes(highlightHop)) {
-      setHighlightHop(null)
+    if (highlightFailovers != null && !highlightGroups.some((group) => group.failovers === highlightFailovers)) {
+      setHighlightFailovers(null)
     }
-  }, [availableHops, highlightHop])
+  }, [highlightGroups, highlightFailovers])
 
   const handleNodeClick = useCallback((node: GatewayDispatchFlowNode) => {
     if (node.kind === "gateway" && node.gateway_group_id) {
@@ -275,6 +301,12 @@ export function DispatchHealthPanel() {
   }, [drillGateway, navigate, range.from, range.to])
 
   const height = flowHeight(flowData)
+  const activeHighlight = highlightFailovers != null
+    ? highlightGroups.find((group) => group.failovers === highlightFailovers) ?? null
+    : null
+  // 记录上一次真正建过图的 flowData，用来分辨"数据变了"和"只是切了高亮"——
+  // 后者不该重放入场动画，那看着就跟重新生成了一张图一样
+  const lastFlowDataRef = useRef<GatewayDispatchFlow | null>(null)
 
   useEffect(() => {
     if (!chartRef.current) return
@@ -284,11 +316,19 @@ export function DispatchHealthPanel() {
     if (!flowData || flowData.requests === 0) {
       chart.current?.dispose()
       chart.current = null
+      lastFlowDataRef.current = null
       return
     }
     if (!chart.current) chart.current = echarts.init(chartRef.current)
     const instance = chart.current
-    instance.setOption(flowOption(flowData, height), true)
+    // 高亮成员（node_ids/link_keys）是后端按整条链路径算好的，这里只负责按成员
+    // 身份把 itemStyle/lineStyle 的不透明度分两档——换句话说，切高亮时这次
+    // setOption 用的还是同一份 flowData，节点数量、连线、value 全都没变，
+    // ECharts 算出来的坐标也就跟上一次分毫不差，只是颜色深浅不同，肉眼看不出
+    // "图被重新画了一张"。真正数据变化（换网关/时间窗口）才会经过下面的动画。
+    const dataChanged = lastFlowDataRef.current !== flowData
+    lastFlowDataRef.current = flowData
+    instance.setOption(flowOption(flowData, height, activeHighlight, dataChanged), true)
     // 容器高度会随节点数变，必须显式 resize——只 setOption 的话画布还是旧尺寸，
     // 内容会被压扁并溢出到下面的区块上
     instance.resize()
@@ -314,25 +354,9 @@ export function DispatchHealthPanel() {
     const resize = () => instance.resize()
     window.addEventListener("resize", resize)
     return () => window.removeEventListener("resize", resize)
-  }, [flowData, height, handleNodeClick])
+  }, [flowData, height, handleNodeClick, activeHighlight])
 
   useEffect(() => () => { chart.current?.dispose(); chart.current = null }, [])
-
-  // 高亮某一跳：只在当前这张已经画好的图上调 ECharts 的 highlight/downplay action，
-  // 不调 setOption、不碰数据——既不重新请求也不重新铺一张图。故意跟上面那个建图的
-  // effect 分开，这样点高亮按钮时只会走这条轻量路径。
-  useEffect(() => {
-    const instance = chart.current
-    if (!instance || !flowData) return
-    instance.dispatchAction({ type: "downplay", seriesIndex: 0 })
-    if (highlightHop == null) return
-    const dataIndex = flowData.nodes
-      .map((node, index) => (node.hop === highlightHop ? index : -1))
-      .filter((index) => index >= 0)
-    if (dataIndex.length > 0) {
-      instance.dispatchAction({ type: "highlight", seriesIndex: 0, dataIndex })
-    }
-  }, [flowData, highlightHop])
 
   const outcomes = useMemo(() => {
     const result = { direct: 0, recovered: 0, failed: 0 }
@@ -396,22 +420,24 @@ export function DispatchHealthPanel() {
           </div>
         ) : null}
       </div>
-      {/* 顺延次数高亮：只在当前这张图上把选中的那一跳点亮、其余调暗，不重新拉数据、
-          不重新铺图。可选项就是这批数据里实际出现过的跳数，不是写死的列表；只有
-          下钻到具体网关时才有意义（全部网关视图里节点没有"跳"这个概念） */}
-      {drillGateway != null && availableHops.length > 0 ? (
+      {/* 顺延次数高亮：点一下把「顺延了这么多次」的链完整路径（入口到结局，不是
+          某一跳的片段）点亮、其余调暗，不重新拉数据、不重新铺图。可选项就是这批
+          数据里实际出现过的顺延次数，不是写死的列表；只有下钻到具体网关时才有
+          意义（全部网关视图里节点没有"顺延几次"这个概念） */}
+      {drillGateway != null && highlightGroups.length > 0 ? (
         <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
           <span className="text-[10px] text-muted-foreground">顺延次数</span>
           <div className="inline-flex flex-wrap rounded-md border border-border bg-muted/30 p-0.5">
-            <button type="button" onClick={() => setHighlightHop(null)}
-              className={cn("h-6 rounded px-1.5 text-[11px]", highlightHop == null ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
+            <button type="button" onClick={() => setHighlightFailovers(null)}
+              className={cn("h-6 rounded px-1.5 text-[11px]", highlightFailovers == null ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
               全部
             </button>
-            {availableHops.map((hop) => (
-              <button key={hop} type="button" onClick={() => setHighlightHop((current) => current === hop ? null : hop)}
-                title={`高亮第 ${hop} 跳（该跳是这条链的第 ${hop - 1} 次顺延，如果中途没有同路由重试的话）`}
-                className={cn("h-6 rounded px-1.5 text-[11px] tabular-nums", highlightHop === hop ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
-                {hop - 1} 次
+            {highlightGroups.map((group) => (
+              <button key={group.failovers} type="button"
+                onClick={() => setHighlightFailovers((current) => current === group.failovers ? null : group.failovers)}
+                title={`高亮顺延了 ${group.failovers} 次的完整请求链（入口到结局）`}
+                className={cn("h-6 rounded px-1.5 text-[11px] tabular-nums", highlightFailovers === group.failovers ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
+                {group.failovers} 次
               </button>
             ))}
           </div>
@@ -430,7 +456,10 @@ export function DispatchHealthPanel() {
             const emptyText = !flowData ? "加载中…" : "当前窗口没有调度记录"
             return (
               <div className="relative rounded-md border border-border/70 bg-background">
-                <div ref={chartRef} style={{ height }} className="w-full" />
+                {/* position:relative + overflow:hidden 是给上面 appendToBody:false 的
+                    tooltip 用的：tooltip 会挂在这层容器内部，被这层裁切，无论算出
+                    什么坐标都跳不出这张卡片 */}
+                <div ref={chartRef} style={{ height, position: "relative", overflow: "hidden" }} className="w-full" />
                 {empty ? (
                   <div className="absolute inset-0 flex items-center justify-center bg-muted/20 text-[11px] text-muted-foreground">
                     {emptyText}

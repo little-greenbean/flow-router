@@ -1300,6 +1300,20 @@ type GatewayDispatchFlow struct {
 	// Gateways 窗口内有流量的网关清单，**不受 groupID 过滤影响**。
 	// 下钻之后前端还要用它画切换用的 tag，所以不能让前端从 nodes 里凑。
 	Gateways []GatewayDispatchFlowGateway `json:"gateways"`
+	// Highlights 按「顺延次数」分组，每组是所有这个次数的链完整覆盖过的节点和连线——
+	// 从进网关到出结局的整条路径，不是某一跳的片段。只在下钻到具体网关（scope=gateway）
+	// 时才有意义，全部网关视图里恒为空。前端点一个次数就是把对应组的节点/连线高亮，
+	// 不用再猜、也不用为了高亮重新请求数据。
+	Highlights []GatewayDispatchFlowHighlight `json:"highlights"`
+}
+
+type GatewayDispatchFlowHighlight struct {
+	// Failovers 这条链一共顺延了几次：总尝试数－1，含同路由重试（口径跟画图时的
+	// 「跳数」一致，跳数本来就是这条链一共打了几次尝试，重试也占一跳）。
+	Failovers int      `json:"failovers"`
+	NodeIDs   []string `json:"node_ids"`
+	// LinkKeys 格式 "source|target"，跟前端 link.source + "|" + link.target 对应
+	LinkKeys []string `json:"link_keys"`
 }
 
 type GatewayDispatchFlowGateway struct {
@@ -1473,7 +1487,7 @@ func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint) (Gatew
 	result := GatewayDispatchFlow{
 		From: from, To: to, Scope: scope, GatewayGroupID: groupID,
 		Nodes: []GatewayDispatchFlowNode{}, Links: []GatewayDispatchFlowLink{},
-		Gateways: []GatewayDispatchFlowGateway{},
+		Gateways: []GatewayDispatchFlowGateway{}, Highlights: []GatewayDispatchFlowHighlight{},
 	}
 	gateways, err := r.dispatchFlowGateways(from, to)
 	if err != nil {
@@ -1623,11 +1637,16 @@ func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint) (Gatew
 		Depth: 0, GatewayGroupID: groupID,
 	})
 	overflowID := "h:more"
+	// 顺延次数高亮：按「这条链一共顺延了几次」（= 总尝试数－1）分组，每组把该组
+	// 所有链**从入口到结局的完整路径**都并进去——不是只记某一跳，用户要的是
+	// 整条请求链，掐头去尾只截一段没意义。
+	highlights := make(map[int]*dispatchFlowHighlightAcc)
 	for _, key := range chainOrder {
 		chain := chains[key]
 		prev := rootID
 		prevIsRoot := true
 		overflowed := false
+		path := []string{rootID}
 		for index, attempt := range chain.attempts {
 			hop := index + 1
 			var nodeID string
@@ -1659,15 +1678,67 @@ func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint) (Gatew
 			builder.link(prev, nodeID, !prevIsRoot)
 			prev = nodeID
 			prevIsRoot = false
+			path = append(path, nodeID)
 		}
 		if prevIsRoot {
 			continue
 		}
 		outcome := dispatchOutcomeOf(chain.attempts)
-		builder.link(prev, ensureOutcome(outcome), outcome == dispatchOutcomeFailed)
+		outcomeNodeID := ensureOutcome(outcome)
+		builder.link(prev, outcomeNodeID, outcome == dispatchOutcomeFailed)
+		path = append(path, outcomeNodeID)
+
+		failovers := len(chain.attempts) - 1
+		acc := highlights[failovers]
+		if acc == nil {
+			acc = newDispatchFlowHighlightAcc()
+			highlights[failovers] = acc
+		}
+		for i, nodeID := range path {
+			acc.nodes[nodeID] = struct{}{}
+			if i > 0 {
+				acc.links[path[i-1]+"|"+nodeID] = struct{}{}
+			}
+		}
 	}
 	result.Nodes, result.Links = builder.build()
+	result.Highlights = buildDispatchFlowHighlights(highlights)
 	return result, nil
+}
+
+type dispatchFlowHighlightAcc struct {
+	nodes map[string]struct{}
+	links map[string]struct{}
+}
+
+func newDispatchFlowHighlightAcc() *dispatchFlowHighlightAcc {
+	return &dispatchFlowHighlightAcc{nodes: make(map[string]struct{}), links: make(map[string]struct{})}
+}
+
+func buildDispatchFlowHighlights(acc map[int]*dispatchFlowHighlightAcc) []GatewayDispatchFlowHighlight {
+	failoverCounts := make([]int, 0, len(acc))
+	for failovers := range acc {
+		failoverCounts = append(failoverCounts, failovers)
+	}
+	sort.Ints(failoverCounts)
+	result := make([]GatewayDispatchFlowHighlight, 0, len(failoverCounts))
+	for _, failovers := range failoverCounts {
+		group := acc[failovers]
+		nodeIDs := make([]string, 0, len(group.nodes))
+		for id := range group.nodes {
+			nodeIDs = append(nodeIDs, id)
+		}
+		sort.Strings(nodeIDs)
+		linkKeys := make([]string, 0, len(group.links))
+		for key := range group.links {
+			linkKeys = append(linkKeys, key)
+		}
+		sort.Strings(linkKeys)
+		result = append(result, GatewayDispatchFlowHighlight{
+			Failovers: failovers, NodeIDs: nodeIDs, LinkKeys: linkKeys,
+		})
+	}
+	return result
 }
 
 // dispatchFlowGateways 统计窗口内每个网关的请求数（链级：一条 request_id 算一次）。
