@@ -1310,9 +1310,8 @@ type GatewayDispatchFlowGateway struct {
 
 // dispatchFlowAttempt 是一条链上的一次尝试，只留画图要用的字段。
 type dispatchFlowAttempt struct {
-	routeID     uint
-	success     bool
-	attemptKind string
+	routeID uint
+	success bool
 }
 
 type dispatchFlowChain struct {
@@ -1461,43 +1460,9 @@ var dispatchOutcomeLabels = map[string]string{
 	dispatchOutcomeFailed:    "最终失败",
 }
 
-// DispatchFlowFailoverFilterAny 表示不筛选（DispatchFlow 的 failoverFilter 参数默认值）。
-const DispatchFlowFailoverFilterAny = -1
-
-// dispatchFlowFailoverFilterOverflow 是「顺延次数」筛选最后一档的分界——达到或超过这个数
-// 都归进同一档「N+ 次」，跟画图时「第 6 跳以后」收进同一个溢出节点是同一个道理：
-// 顺延次数没有自然上限，非得每个数字都单独一档只会让筛选器本身也变得又长又碎。
-const dispatchFlowFailoverFilterOverflow = 5
-
-// dispatchFlowFailoverCount 数的是「顺延」——同链内 attempt_kind=failover 的尝试数，
-// 不含同路由重试（retry）。这跟别处（记分卡时代的 MaxFailoverDepth）用的是同一个
-// 口径，别跟桑基图里的「跳数」混——跳数是这条链一共打了几次尝试，重试也占一跳。
-func dispatchFlowFailoverCount(attempts []dispatchFlowAttempt) int {
-	count := 0
-	for _, attempt := range attempts {
-		if attempt.attemptKind == "failover" {
-			count++
-		}
-	}
-	return count
-}
-
-// dispatchFlowMatchesFailoverFilter：filter < 0 不筛选；
-// filter 达到 dispatchFlowFailoverFilterOverflow 时是「N+ 次」，其余为精确匹配。
-func dispatchFlowMatchesFailoverFilter(count, filter int) bool {
-	if filter < 0 {
-		return true
-	}
-	if filter >= dispatchFlowFailoverFilterOverflow {
-		return count >= dispatchFlowFailoverFilterOverflow
-	}
-	return count == filter
-}
-
 // DispatchFlow 汇总窗口内的请求流向。groupID = 0 时是「全部网关」视图，
-// 否则下钻到该网关内部，按跳数展开到具体路由。failoverFilter 见
-// dispatchFlowMatchesFailoverFilter；传 DispatchFlowFailoverFilterAny 表示不筛选。
-func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint, failoverFilter int) (GatewayDispatchFlow, error) {
+// 否则下钻到该网关内部，按跳数展开到具体路由。
+func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint) (GatewayDispatchFlow, error) {
 	if from.IsZero() || to.IsZero() || !to.After(from) {
 		return GatewayDispatchFlow{}, fmt.Errorf("invalid dispatch flow range")
 	}
@@ -1546,7 +1511,7 @@ func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint, failov
 			chains[key] = chain
 			chainOrder = append(chainOrder, key)
 		}
-		chain.attempts = append(chain.attempts, dispatchFlowAttempt{routeID: log.RouteID, success: log.Success, attemptKind: log.AttemptKind})
+		chain.attempts = append(chain.attempts, dispatchFlowAttempt{routeID: log.RouteID, success: log.Success})
 		groupIDs[log.GatewayGroupID] = struct{}{}
 		routeIDs[log.RouteID] = struct{}{}
 		if log.ChannelID > 0 {
@@ -1558,17 +1523,6 @@ func (r *GatewayUsageLogs) DispatchFlow(from, to time.Time, groupID uint, failov
 			identities[log.RouteID] = identity
 		}
 		identity.absorb(log)
-	}
-	// 顺延次数筛选：先按链过滤，Requests/Attempts/MaxHops 都以过滤后的结果为准，
-	// 这样表头「N 请求 / M 次尝试」和图上画的是同一批数据，不会对不上。
-	if failoverFilter != DispatchFlowFailoverFilterAny {
-		filtered := chainOrder[:0]
-		for _, key := range chainOrder {
-			if dispatchFlowMatchesFailoverFilter(dispatchFlowFailoverCount(chains[key].attempts), failoverFilter) {
-				filtered = append(filtered, key)
-			}
-		}
-		chainOrder = filtered
 	}
 	result.Requests = len(chainOrder)
 	attempts := 0

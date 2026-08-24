@@ -13,7 +13,6 @@ import type {
   GatewayDispatchWindow,
 } from "@/lib/api-types"
 import {
-  DISPATCH_FAILOVER_FILTER_OPTIONS,
   DISPATCH_RANGE_OPTIONS,
   dispatchRangeMinutes,
   dispatchRoutePath,
@@ -31,6 +30,11 @@ import { cn } from "@/lib/utils"
  * 请求真的走了这条路。默认按网关分流，点 tag 直接换网关；下钻后按「第几跳打在
  * 哪条路由上」逐层铺开。图上每类节点都是一个动作：路由 → 跳到路由配置，
  * 结局 → 跳到使用记录并带上对应筛选。
+ *
+ * 下钻某个网关后，上方会出现按跳数分的高亮按钮：点一下不重新请求数据、也不
+ * 重新铺一张图，只是在当前这张图上把该跳的节点和相邻连线点亮、其余调暗
+ * （ECharts 的 highlight/downplay action，配合已有的 emphasis.focus:'adjacency'）。
+ * 可选的跳数直接取自当前已经加载的数据里实际出现过的跳数，不是固定列表。
  */
 
 /**
@@ -209,8 +213,8 @@ function flowOption(flow: GatewayDispatchFlow, chartHeight: number) {
 export function DispatchHealthPanel() {
   const [rangeValue, setRangeValue] = useState<GatewayDispatchWindow>("1h")
   const [drillGateway, setDrillGateway] = useState<number | null>(null)
-  // null = 全部，不筛；否则精确匹配顺延次数（5 是「5+」这一档，见 DISPATCH_FAILOVER_FILTER_OPTIONS）
-  const [failoverFilter, setFailoverFilter] = useState<number | null>(null)
+  // null = 不高亮任何一跳；否则是被选中的跳数（从当前数据里实际出现过的跳数中选）
+  const [highlightHop, setHighlightHop] = useState<number | null>(null)
   const tick = useRefreshTick()
   const navigate = useNavigate()
 
@@ -221,9 +225,7 @@ export function DispatchHealthPanel() {
     return { from, to, fromISO: from.toISOString(), toISO: to.toISOString() }
   }, [rangeValue, tick])
 
-  const flow = useGatewayDispatchFlow(
-    range.fromISO, range.toISO, drillGateway ?? undefined, failoverFilter ?? undefined,
-  )
+  const flow = useGatewayDispatchFlow(range.fromISO, range.toISO, drillGateway ?? undefined)
   const flowData = flow.data
   const chartRef = useRef<HTMLDivElement | null>(null)
   const chart = useRef<echarts.ECharts | null>(null)
@@ -235,6 +237,24 @@ export function DispatchHealthPanel() {
       setDrillGateway(null)
     }
   }, [flowData, drillGateway])
+
+  // 下钻到该网关内部才有「跳」这个概念——路由节点才带 hop，网关/结局节点没有
+  const availableHops = useMemo(() => {
+    if (!flowData) return []
+    const hops = new Set<number>()
+    for (const node of flowData.nodes) {
+      if (node.kind === "route" && node.hop) hops.add(node.hop)
+    }
+    return [...hops].sort((a, b) => a - b)
+  }, [flowData])
+
+  // 换了网关/时间窗口后，之前选的那一跳可能已经不存在了（比如原来选第 4 跳，
+  // 新数据最深只到第 2 跳），清掉免得按钮选中态和实际高亮对不上
+  useEffect(() => {
+    if (highlightHop != null && !availableHops.includes(highlightHop)) {
+      setHighlightHop(null)
+    }
+  }, [availableHops, highlightHop])
 
   const handleNodeClick = useCallback((node: GatewayDispatchFlowNode) => {
     if (node.kind === "gateway" && node.gateway_group_id) {
@@ -298,6 +318,22 @@ export function DispatchHealthPanel() {
 
   useEffect(() => () => { chart.current?.dispose(); chart.current = null }, [])
 
+  // 高亮某一跳：只在当前这张已经画好的图上调 ECharts 的 highlight/downplay action，
+  // 不调 setOption、不碰数据——既不重新请求也不重新铺一张图。故意跟上面那个建图的
+  // effect 分开，这样点高亮按钮时只会走这条轻量路径。
+  useEffect(() => {
+    const instance = chart.current
+    if (!instance || !flowData) return
+    instance.dispatchAction({ type: "downplay", seriesIndex: 0 })
+    if (highlightHop == null) return
+    const dataIndex = flowData.nodes
+      .map((node, index) => (node.hop === highlightHop ? index : -1))
+      .filter((index) => index >= 0)
+    if (dataIndex.length > 0) {
+      instance.dispatchAction({ type: "highlight", seriesIndex: 0, dataIndex })
+    }
+  }, [flowData, highlightHop])
+
   const outcomes = useMemo(() => {
     const result = { direct: 0, recovered: 0, failed: 0 }
     for (const node of flowData?.nodes ?? []) {
@@ -360,40 +396,38 @@ export function DispatchHealthPanel() {
           </div>
         ) : null}
       </div>
-      <p className="mb-1 text-[10px] text-muted-foreground">
-        {drillGateway != null
-          ? "每一列是第几跳，线越粗走的请求越多；红色的线是「这一跳失败后转走的」。点路由跳到它的配置，点右侧结局跳到使用记录。"
-          : "点网关（图上或上面的 tag）下钻，看它内部顺延到哪几条路由；点右侧结局跳到使用记录并带上对应筛选。"}
-      </p>
-      {/* 顺延次数筛选：只看「顺延了 N 次」的那批链，别的先滤掉不画——对当前这一层
-          （全部网关或某个下钻后的网关）都生效，跟时间粒度、网关 tag 一样是持久状态 */}
-      <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
-        <span className="text-[10px] text-muted-foreground">顺延次数</span>
-        <div className="inline-flex flex-wrap rounded-md border border-border bg-muted/30 p-0.5">
-          {DISPATCH_FAILOVER_FILTER_OPTIONS.map((option) => (
-            <button key={option.label} type="button" onClick={() => setFailoverFilter(option.value)}
-              className={cn("h-6 rounded px-1.5 text-[11px]", failoverFilter === option.value ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
-              {option.label}
+      {/* 顺延次数高亮：只在当前这张图上把选中的那一跳点亮、其余调暗，不重新拉数据、
+          不重新铺图。可选项就是这批数据里实际出现过的跳数，不是写死的列表；只有
+          下钻到具体网关时才有意义（全部网关视图里节点没有"跳"这个概念） */}
+      {drillGateway != null && availableHops.length > 0 ? (
+        <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+          <span className="text-[10px] text-muted-foreground">顺延次数</span>
+          <div className="inline-flex flex-wrap rounded-md border border-border bg-muted/30 p-0.5">
+            <button type="button" onClick={() => setHighlightHop(null)}
+              className={cn("h-6 rounded px-1.5 text-[11px]", highlightHop == null ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
+              全部
             </button>
-          ))}
+            {availableHops.map((hop) => (
+              <button key={hop} type="button" onClick={() => setHighlightHop((current) => current === hop ? null : hop)}
+                title={`高亮第 ${hop} 跳（该跳是这条链的第 ${hop - 1} 次顺延，如果中途没有同路由重试的话）`}
+                className={cn("h-6 rounded px-1.5 text-[11px] tabular-nums", highlightHop === hop ? "bg-background font-semibold shadow-sm" : "text-muted-foreground")}>
+                {hop - 1} 次
+              </button>
+            ))}
+          </div>
         </div>
-      </div>
+      ) : null}
 
       {flow.error
         ? <p className="rounded-md border border-danger/25 bg-danger/5 p-3 text-[11px] text-danger">请求流向加载失败：{flow.error}</p>
         : (() => {
-            // 顺延次数筛完没剩下任何链时，节点列表里还会留一个孤零零的网关/根节点（没有
-            // requests），单看 nodes.length 会漏判——用 requests 才是「有没有数据可画」的准头。
-            //
             // 图表容器故意**始终挂载**，用浮层盖住加载中/空态，而不是像别处那样直接换成
             // 另一棵子树：那样切换时 chart 容器会被卸载，chartRef 变 null，图表初始化的
             // effect 里 `if (!chartRef.current) return` 会在 dispose 之前就退出，旧的
-            // ECharts 实例既没释放也绑定不到新容器上——顺延次数在“有匹配”和“没匹配”之间
-            // 来回切，图表会卡死在最后一次成功渲染的画面上，不会跟着筛选更新。
+            // ECharts 实例既没释放也绑定不到新容器上——时间窗口在"有数据"和"没数据"之间
+            // 来回切，图表会卡死在最后一次成功渲染的画面上。
             const empty = !flowData || flowData.requests === 0
-            const emptyText = !flowData ? "加载中…"
-              : failoverFilter != null ? "当前顺延次数筛选下没有匹配的请求，试试放宽筛选"
-              : "当前窗口没有调度记录"
+            const emptyText = !flowData ? "加载中…" : "当前窗口没有调度记录"
             return (
               <div className="relative rounded-md border border-border/70 bg-background">
                 <div ref={chartRef} style={{ height }} className="w-full" />
