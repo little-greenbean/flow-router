@@ -89,15 +89,25 @@ function nodeColor(node: GatewayDispatchFlowNode): string {
 }
 
 /**
- * 图高按最挤的那一列算。一定要留够：节点被压扁之后标签会叠在一起，
- * 甚至溢出画布压到下面的内容上。
+ * 图高。
+ *
+ * 只按「最挤的那一列有几个节点」算是不够的：顺延深的网关往往每一列只有两三个节点，
+ * 按这个口径会落到 300px 兜底，然后 7 列 17 个节点全塞进去——实测 GPT Plus 那张图，
+ * 中间几跳的节点高度只有 2.8 / 4.1 / 9.7 像素，标签全被压在中间一条 90px 宽的带子里，
+ * 看着就是"全叠在一块"。
+ *
+ * 原因是 ECharts 的像素/值比例是全图统一的（minKy ≈ (图高 - 边距 - 间隙) / 入口列总量），
+ * 图高翻倍，所有节点跟着翻倍，relax 也就有地方把它们摊开。所以还要按节点总数给一个
+ * 下限——节点多就得给纵向空间，跟它们怎么分列无关。
  */
 function flowHeight(flow: GatewayDispatchFlow | null | undefined): number {
-  if (!flow || flow.nodes.length === 0) return 300
+  if (!flow || flow.nodes.length === 0) return 320
   const perDepth = new Map<number, number>()
   for (const node of flow.nodes) perDepth.set(node.depth, (perDepth.get(node.depth) ?? 0) + 1)
   const widest = Math.max(...perDepth.values())
-  return Math.min(900, Math.max(300, widest * 44 + 90))
+  // 节点总数的一半当行数：同一行里不同列的节点可以共用纵向位置，但也就到这个程度了
+  const rows = Math.max(widest, Math.ceil(flow.nodes.length / 2))
+  return Math.min(900, Math.max(320, rows * 46 + 90))
 }
 
 const NODE_WIDTH = 13
@@ -145,7 +155,10 @@ function flowOption(
     // 结局列是我们自己的短词（一次过 / 顺延后成功 / 最终失败），按预留的那块地算
     if (depth === maxDepth) return Math.max(48, OUTCOME_LABEL_RESERVE)
     const reserve = depth === maxDepth - 1 ? OUTCOME_LABEL_RESERVE : 0
-    return Math.max(48, columnGap - NODE_WIDTH - 18 - reserve)
+    // 留 12px：标签右边缘落在 x + NODE_WIDTH + 5(distance) + budget，离下一列节点还有
+    // 7px。实测过（canvas measureText 逐个量标签框）这个余量下没有任何标签压到下一列的
+    // 节点或别的标签上，再多留就要开始把路由名截断了
+    return Math.max(48, columnGap - NODE_WIDTH - 12 - reserve)
   }
 
   return {
