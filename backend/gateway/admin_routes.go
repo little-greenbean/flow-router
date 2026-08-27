@@ -49,7 +49,7 @@ func (a *AdminService) orderRoutesForGroup(groupID uint, list []storage.GatewayR
 			dir = d
 		}
 	}
-	groupsByChannel := a.loadGroupsByChannel(context.Background(), list)
+	groupsByChannel := a.loadGroupsByChannelBlocking(context.Background(), list)
 	ordered := OrderRoutesByRate(list, groupsByChannel, dir)
 	// 与同步账号 Apply 一致：用实时源分组换算结果写回 billing_rate_multiplier
 	for i := range ordered {
@@ -178,7 +178,7 @@ func (a *AdminService) SaveRoutes(groupID uint, inputs []RouteInput) ([]storage.
 	if dir == "" {
 		dir = "asc"
 	}
-	groupsByChannel := a.loadGroupsByChannel(context.Background(), list)
+	groupsByChannel := a.loadGroupsByChannelBlocking(context.Background(), list)
 	// sub2api 等有 group id 的渠道：补全空/占位的源分组名称，避免 UI 只显示「源 ID: N」
 	for i := range list {
 		a.enrichRouteSourceGroupName(&list[i], groupsByChannel[list[i].SourceChannelID])
