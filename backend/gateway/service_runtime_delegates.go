@@ -46,6 +46,11 @@ func (s *Service) loadGroupsByChannel(ctx context.Context, routes []storage.Gate
 	return s.runtime().loadGroupsByChannel(ctx, routes)
 }
 
+// loadGroupsByChannelBlocking 同步拉取源分组（管理面保存/重排专用）。
+func (s *Service) loadGroupsByChannelBlocking(ctx context.Context, routes []storage.GatewayRoute) map[uint][]connector.APIKeyGroup {
+	return s.runtime().loadGroupsByChannelBlocking(ctx, routes)
+}
+
 func (s *Service) storeChannelGroupsCache(channelID uint, groups []connector.APIKeyGroup) {
 	s.runtime().storeChannelGroupsCache(channelID, groups)
 }

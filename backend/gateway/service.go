@@ -65,8 +65,9 @@ type Service struct {
 	modelsCache   map[uint]modelsCacheEntry // keyed by group id
 
 	// 源分组列表缓存（ListAPIKeyGroups 远程调用昂贵；列表接口不再实时拉，运行时/保存仍可复用缓存）
-	channelGroupsCacheMu sync.Mutex
-	channelGroupsCache   map[uint]channelGroupsCacheEntry // keyed by channel id
+	channelGroupsCacheMu    sync.Mutex
+	channelGroupsCache      map[uint]channelGroupsCacheEntry // keyed by channel id
+	channelGroupsRefreshing map[uint]struct{}                // 后台刷新单飞占位，keyed by channel id
 }
 
 type modelsCacheEntry struct {
@@ -92,19 +93,20 @@ func NewService(
 	log *slog.Logger,
 ) *Service {
 	s := &Service{
-		Groups:             groups,
-		Keys:               keys,
-		Routes:             routes,
-		Usage:              usage,
-		Prices:             prices,
-		Channels:           channels,
-		ChannelAPI:         channelAPI,
-		Cipher:             cipher,
-		Pricing:            NewPricingCatalog(prices),
-		Log:                log,
-		gatewayCfg:         config.GatewayConfig{}.WithDefaults(),
-		modelsCache:        map[uint]modelsCacheEntry{},
-		channelGroupsCache: map[uint]channelGroupsCacheEntry{},
+		Groups:                  groups,
+		Keys:                    keys,
+		Routes:                  routes,
+		Usage:                   usage,
+		Prices:                  prices,
+		Channels:                channels,
+		ChannelAPI:              channelAPI,
+		Cipher:                  cipher,
+		Pricing:                 NewPricingCatalog(prices),
+		Log:                     log,
+		gatewayCfg:              config.GatewayConfig{}.WithDefaults(),
+		modelsCache:             map[uint]modelsCacheEntry{},
+		channelGroupsCache:      map[uint]channelGroupsCacheEntry{},
+		channelGroupsRefreshing: map[uint]struct{}{},
 	}
 	s.Admin = &AdminService{Service: s}
 	s.Runtime = &Runtime{Service: s}
