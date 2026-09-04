@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"math/rand"
 	"sort"
 	"strings"
 	"time"
@@ -72,7 +73,7 @@ func IsRouteSchedulable(route *storage.GatewayRoute, now time.Time) bool {
 
 // routeRateLess 比较两条路由优先级（与同步账号 sortAccountsForApply 一致）。
 // direction: asc 低倍率优先；desc 高倍率优先。
-// 同倍率：权重大优先；再比 position；再比 id。
+// 同倍率：按 Position 排位；再比 id。（weight 用于 SortRoutes 加权分流，不参与排序）
 func routeRateLess(a, b storage.GatewayRoute, rateA, rateB float64, desc bool) bool {
 	if rateA != rateB {
 		if desc {
@@ -80,9 +81,7 @@ func routeRateLess(a, b storage.GatewayRoute, rateA, rateB float64, desc bool) b
 		}
 		return rateA < rateB
 	}
-	if a.Weight != b.Weight {
-		return a.Weight > b.Weight
-	}
+	// 同价：优先级(Position)排位；weight 交给 SortRoutes 做加权分流
 	if a.Position != b.Position {
 		return a.Position < b.Position
 	}
@@ -108,8 +107,7 @@ func OrderRoutesByRate(routes []storage.GatewayRoute, groupsByChannel map[uint][
 	}
 	desc := strings.EqualFold(strings.TrimSpace(direction), "desc")
 	sort.SliceStable(items, func(i, j int) bool {
-		if items[i].rate != items[j].rate || items[i].route.Weight != items[j].route.Weight ||
-			items[i].route.Position != items[j].route.Position {
+		if items[i].rate != items[j].rate || items[i].route.Position != items[j].route.Position {
 			return routeRateLess(items[i].route, items[j].route, items[i].rate, items[j].rate, desc)
 		}
 		return items[i].idx < items[j].idx
@@ -122,7 +120,7 @@ func OrderRoutesByRate(routes []storage.GatewayRoute, groupsByChannel map[uint][
 	return out
 }
 
-// SortRoutes 按倍率方向 + 权重 + position 排序（仅可调度路由，用于运行时 failover）。
+// SortRoutes 按倍率方向分档 + 同价内按 Weight 加权随机分流（仅可调度路由，用于运行时选路/failover）。
 // direction: asc 低倍率优先；desc 高倍率优先。
 //
 // BillingRate 即 RateForRoute 换算结果（原值 / ×100 / ÷100 / 自定义），
@@ -147,5 +145,54 @@ func SortRoutes(routes []storage.GatewayRoute, groupsByChannel map[uint][]connec
 	sort.SliceStable(out, func(i, j int) bool {
 		return routeRateLess(out[i].Route, out[j].Route, out[i].EffectiveRate, out[j].EffectiveRate, desc)
 	})
+	// 同价区块内按 Weight 加权分流；out[0] 即一次加权抽签
+	weightedShuffleByRate(out)
 	return out
+}
+
+// weightedShuffleByRate 在每个「同价格」区块内按 Weight 做不放回加权抽样重排，
+// 使 out[0] 成为一次加权抽签（P=wi/Σw），从而同价按权重分流；不同价区块顺序不变。
+func weightedShuffleByRate(routes []ScoredRoute) {
+	i := 0
+	for i < len(routes) {
+		j := i + 1
+		for j < len(routes) && routes[j].EffectiveRate == routes[i].EffectiveRate {
+			j++
+		}
+		if j-i > 1 {
+			weightedPermute(routes[i:j])
+		}
+		i = j
+	}
+}
+
+// weightedPermute 就地对同价区段做不放回加权抽样重排：
+// 正权重路由按权重分布到前面，Weight<=0 的仅作末位 failover 兜底。
+func weightedPermute(seg []ScoredRoute) {
+	n := len(seg)
+	for start := 0; start < n-1; start++ {
+		total := 0
+		for k := start; k < n; k++ {
+			if w := seg[k].Route.Weight; w > 0 {
+				total += w
+			}
+		}
+		if total <= 0 {
+			return
+		}
+		r := rand.Intn(total)
+		pick, acc := start, 0
+		for k := start; k < n; k++ {
+			w := seg[k].Route.Weight
+			if w <= 0 {
+				continue
+			}
+			acc += w
+			if r < acc {
+				pick = k
+				break
+			}
+		}
+		seg[start], seg[pick] = seg[pick], seg[start]
+	}
 }

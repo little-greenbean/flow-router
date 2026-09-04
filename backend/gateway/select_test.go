@@ -19,9 +19,12 @@ func TestSortRoutes_RateThenWeight(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("len=%d", len(got))
 	}
-	// rate 0.2 first; among 0.2 weight 10 before 5
-	if got[0].Route.ID != 2 || got[1].Route.ID != 3 || got[2].Route.ID != 1 {
-		t.Fatalf("order=%v %v %v", got[0].Route.ID, got[1].Route.ID, got[2].Route.ID)
+	// rate 0.2 档在前（2、3 加权随机任意序），rate 0.5 档(1) 恒在最后
+	if got[2].Route.ID != 1 {
+		t.Fatalf("rate 0.5 route should be last, got %v", got[2].Route.ID)
+	}
+	if !((got[0].Route.ID == 2 && got[1].Route.ID == 3) || (got[0].Route.ID == 3 && got[1].Route.ID == 2)) {
+		t.Fatalf("rate 0.2 tier wrong: %v %v", got[0].Route.ID, got[1].Route.ID)
 	}
 }
 
@@ -92,15 +95,15 @@ func TestRateForRoute_FallbackBillingMultiplier(t *testing.T) {
 	}
 }
 
-func TestOrderRoutesByRate_SameRateHigherWeightFirst(t *testing.T) {
+func TestOrderRoutesByRate_SameRateByPosition(t *testing.T) {
 	routes := []storage.GatewayRoute{
 		{ID: 1, Position: 0, Weight: 1, Enabled: true, RateConvertMode: "custom", RateConvertValue: 0.05, SourceAPIKeyCipher: "x"},
 		{ID: 2, Position: 1, Weight: 99, Enabled: true, RateConvertMode: "custom", RateConvertValue: 0.05, SourceAPIKeyCipher: "x"},
 	}
-	// 输入顺序：低权重在前；同倍率应按权重大优先
+	// 同倍率现按 Position(优先级)排位：pos0 的 ID1 在前，与 weight 无关
 	ordered := OrderRoutesByRate(routes, nil, "asc")
-	if ordered[0].ID != 2 || ordered[1].ID != 1 {
-		t.Fatalf("want weight 99 first, got ids %d %d", ordered[0].ID, ordered[1].ID)
+	if ordered[0].ID != 1 || ordered[1].ID != 2 {
+		t.Fatalf("want position order [1,2], got ids %d %d", ordered[0].ID, ordered[1].ID)
 	}
 }
 
@@ -194,5 +197,27 @@ func TestRateForRoute_RawIsSourceRatio(t *testing.T) {
 	got := RateForRoute(route, groups)
 	if got != 0.06 {
 		t.Fatalf("raw mode should keep source ratio, got %v want 0.06", got)
+	}
+}
+
+func TestSortRoutes_WeightedSplit(t *testing.T) {
+	now := time.Now()
+	routes := []storage.GatewayRoute{
+		{ID: 1, SourceChannelID: 1, Position: 0, Weight: 3, Enabled: true, RateConvertMode: "custom", RateConvertValue: 0.1, SourceAPIKeyCipher: "x", BillingRateMultiplier: 1},
+		{ID: 2, SourceChannelID: 2, Position: 1, Weight: 1, Enabled: true, RateConvertMode: "custom", RateConvertValue: 0.1, SourceAPIKeyCipher: "x", BillingRateMultiplier: 1},
+	}
+	const N = 20000
+	first := map[uint]int{}
+	for i := 0; i < N; i++ {
+		got := SortRoutes(routes, nil, "asc", now, nil)
+		if len(got) != 2 {
+			t.Fatalf("len=%d", len(got))
+		}
+		first[got[0].Route.ID]++
+	}
+	// 权重 3:1 → ID1 首选概率 ~0.75
+	ratio := float64(first[1]) / float64(N)
+	if ratio < 0.72 || ratio > 0.78 {
+		t.Fatalf("weight 3:1 expect ~0.75 first-pick for ID1, got %.3f (counts %v)", ratio, first)
 	}
 }
