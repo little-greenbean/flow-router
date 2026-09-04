@@ -17,6 +17,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// wsClientReadLimitBytes 是客户端 WebSocket 单帧读上限（64MiB），
+// 覆盖 coder/websocket 默认的 32KiB。
+const wsClientReadLimitBytes = 64 << 20
+
 // HandleResponsesWebSocket forwards native Responses WebSocket sessions. A
 // WebSocket session cannot safely change protocol mid-flight, so only routes
 // whose resolved upstream protocol is Responses are eligible.
@@ -45,6 +49,11 @@ func (rt *Runtime) HandleResponsesWebSocket(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	// coder/websocket 默认读上限仅 32KiB，而 Responses 的 response.create 帧要携带
+	// 完整上下文（生产常见 10-15 万 token ≈ 400-600KB），不放开会在读第一帧时就
+	// 以 "read limited at 32769 bytes" 关闭连接。与号池侧 client_read_limit_bytes
+	// 的默认值（64MiB）保持一致。
+	client.SetReadLimit(wsClientReadLimitBytes)
 	defer client.CloseNow()
 
 	ctx, cancel := context.WithCancel(context.Background())
